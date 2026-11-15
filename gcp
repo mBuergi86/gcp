@@ -1,0 +1,349 @@
+#!/usr/bin/env bash
+# gcp - stage, commit and push all changes in one step, with safety checks.
+#
+# Usage: gcp [-y|--yes] "<type>[(scope)][!]: [gitmoji] <description>"
+#   -y, --yes   skip the confirmation prompt (also: GCP_YES=1)
+#   e.g. gcp "fix(api): handle empty response"
+#        -> fix(api): 🐛 handle empty response
+#
+# Commit messages must follow Conventional Commits 1.0.0:
+#   https://www.conventionalcommits.org/en/v1.0.0/
+# A gitmoji (https://gitmoji.dev) is added after the colon based on the type.
+# If you write your own gitmoji (unicode or :shortcode:), it is kept.
+# Breaking changes always get 💥.
+#
+# Release tagging (only on release/X.Y branches):
+#   fix                 -> next patch tag vX.Y.Z, created and pushed automatically
+#   feat, or breaking   -> rejected (needs a new release branch)
+#   all other types     -> committed and pushed, no tag
+#
+# Requires: git >= 2.22, gitleaks >= 8.19, bash >= 4
+# Env overrides:
+#   ALLOW_MAIN=1      allow committing directly to main/master
+#   SKIP_GITLEAKS=1   skip the content secret scan (not recommended)
+set -euo pipefail
+
+MAX_FILE_MIB=100
+MAX_HEADER_LENGTH=72
+CC_TYPES='feat|fix|build|chore|ci|docs|style|refactor|perf|test|revert'
+
+# Type -> gitmoji (https://github.com/carloscuesta/gitmoji)
+declare -A GITMOJI=(
+    [feat]="✨"
+    [fix]="🐛"
+    [docs]="📝"
+    [style]="🎨"
+    [refactor]="♻️"
+    [perf]="⚡️"
+    [test]="✅"
+    [build]="📦️"
+    [ci]="👷"
+    [chore]="🔧"
+    [revert]="⏪️"
+)
+GITMOJI_BREAKING="💥"
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+unstage_all() {
+    # Works on normal branches and on a fresh repo without commits
+    git reset -q 2>/dev/null || git rm -r -q --cached . >/dev/null 2>&1 || true
+}
+
+abort_unstaged() {
+    unstage_all
+    echo "Nothing was committed, changes were unstaged." >&2
+    exit 1
+}
+
+# True if the word is a gitmoji shortcode (:bug:) or contains non-ASCII (unicode emoji)
+is_emoji() {
+    local word="$1"
+    [[ "$word" =~ ^:[a-z0-9_+-]+:$ ]] && return 0
+    printf '%s' "$word" | LC_ALL=C grep -q '[^ -~]'
+}
+
+# ---------------------------------------------------------------------------
+# Arguments and commit message
+# ---------------------------------------------------------------------------
+
+ASSUME_YES="${GCP_YES:-0}"
+if [[ "${1:-}" == "-y" || "${1:-}" == "--yes" ]]; then
+    ASSUME_YES=1
+    shift
+fi
+
+if [[ $# -ne 1 ]]; then
+    die "usage: $(basename "$0") [-y|--yes] \"<type>[(scope)][!]: <description>\" (quote the message)"
+fi
+
+# Trim leading and trailing whitespace
+RAW_MESSAGE="$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+[[ -n "$RAW_MESSAGE" ]] || die "commit message is empty."
+
+RAW_HEADER="$(printf '%s\n' "$RAW_MESSAGE" | head -n1)"
+# Body without leading blank lines (re-added as exactly one separator below)
+BODY="$(printf '%s\n' "$RAW_MESSAGE" | tail -n +2 | sed '/./,$!d')"
+
+CC_REGEX="^(${CC_TYPES})(\([a-z0-9._/-]+\))?(!)?: ([^[:space:]].*)$"
+
+if [[ ! "$RAW_HEADER" =~ $CC_REGEX ]]; then
+    echo "Error: commit message does not follow Conventional Commits." >&2
+    echo "  Got:      $RAW_HEADER" >&2
+    echo "  Expected: <type>[(scope)][!]: <description>" >&2
+    echo "  Types:    ${CC_TYPES//|/, }" >&2
+    echo "  Example:  fix(api): handle empty response" >&2
+    exit 1
+fi
+
+CC_TYPE="${BASH_REMATCH[1]}"
+CC_SCOPE="${BASH_REMATCH[2]}"
+CC_BANG="${BASH_REMATCH[3]}"
+DESCRIPTION="${BASH_REMATCH[4]}"
+
+IS_BREAKING=0
+if [[ -n "$CC_BANG" ]] || printf '%s\n' "$BODY" | grep -Eq '^BREAKING[ -]CHANGE: '; then
+    IS_BREAKING=1
+fi
+
+# Gitmoji: keep the user's own, otherwise add one based on type
+FIRST_WORD="${DESCRIPTION%% *}"
+if is_emoji "$FIRST_WORD"; then
+    REST="${DESCRIPTION#"$FIRST_WORD"}"
+    REST="${REST#"${REST%%[![:space:]]*}"}"
+    [[ -n "$REST" ]] || die "description is missing after the gitmoji."
+else
+    if (( IS_BREAKING )); then
+        DESCRIPTION="$GITMOJI_BREAKING $DESCRIPTION"
+    else
+        DESCRIPTION="${GITMOJI[$CC_TYPE]} $DESCRIPTION"
+    fi
+fi
+
+HEADER="${CC_TYPE}${CC_SCOPE}${CC_BANG}: ${DESCRIPTION}"
+if [[ -n "$BODY" ]]; then
+    # Git needs a blank line between subject and body/footer
+    MESSAGE="${HEADER}"$'\n\n'"${BODY}"
+else
+    MESSAGE="$HEADER"
+fi
+
+if (( ${#HEADER} > MAX_HEADER_LENGTH )); then
+    die "commit header is ${#HEADER} characters, max is ${MAX_HEADER_LENGTH}."
+fi
+
+# ---------------------------------------------------------------------------
+# Repository state
+# ---------------------------------------------------------------------------
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not a git repository."
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+if [[ "${SKIP_GITLEAKS:-0}" != "1" ]]; then
+    command -v gitleaks >/dev/null 2>&1 \
+        || die "gitleaks not found. Install it or run with SKIP_GITLEAKS=1."
+    gitleaks git --help >/dev/null 2>&1 \
+        || die "gitleaks is too old (needs >= 8.19 for 'gitleaks git')."
+fi
+
+GIT_DIR="$(git rev-parse --git-dir)"
+if [[ -d "$GIT_DIR/rebase-merge" || -d "$GIT_DIR/rebase-apply" \
+   || -f "$GIT_DIR/MERGE_HEAD" || -f "$GIT_DIR/CHERRY_PICK_HEAD" ]]; then
+    die "a rebase, merge or cherry-pick is in progress. Finish or abort it first."
+fi
+
+if [[ -z "$(git status --porcelain)" ]]; then
+    echo "Nothing to commit."
+    exit 0
+fi
+
+BRANCH="$(git branch --show-current)"
+[[ -n "$BRANCH" ]] || die "detached HEAD, check out a branch first."
+
+if [[ "$BRANCH" == "main" || "$BRANCH" == "master" ]] && [[ "${ALLOW_MAIN:-0}" != "1" ]]; then
+    die "refusing to commit directly to $BRANCH. Use a feature or release branch, or run with ALLOW_MAIN=1."
+fi
+
+# Resolve remote: upstream remote first, otherwise the only configured remote
+REMOTE="$(git config --get "branch.$BRANCH.remote" || true)"
+if [[ -z "$REMOTE" ]]; then
+    mapfile -t REMOTES < <(git remote)
+    case ${#REMOTES[@]} in
+        0) die "no remote configured." ;;
+        1) REMOTE="${REMOTES[0]}" ;;
+        *) die "multiple remotes and no upstream for $BRANCH. Push once manually: git push -u <remote> $BRANCH" ;;
+    esac
+fi
+
+# ---------------------------------------------------------------------------
+# Release branch rules
+# ---------------------------------------------------------------------------
+
+IS_RELEASE=0
+WILL_TAG=0
+REL_MAJOR=""
+REL_MINOR=""
+
+if [[ "$BRANCH" == release/* ]]; then
+    if [[ ! "$BRANCH" =~ ^release/([0-9]+)\.([0-9]+)$ ]]; then
+        die "release branches must be named release/X.Y (e.g. release/1.4), got: $BRANCH"
+    fi
+    IS_RELEASE=1
+    REL_MAJOR="${BASH_REMATCH[1]}"
+    REL_MINOR="${BASH_REMATCH[2]}"
+
+    if (( IS_BREAKING )); then
+        die "breaking changes are not allowed on $BRANCH. They need a new major release branch."
+    fi
+    if [[ "$CC_TYPE" == "feat" ]]; then
+        die "feat is not allowed on $BRANCH. New features need a new minor release branch."
+    fi
+    if [[ "$CC_TYPE" == "fix" ]]; then
+        WILL_TAG=1
+    fi
+fi
+
+# Fetch tags and make sure the release line has a base tag before committing
+if (( WILL_TAG )); then
+    git fetch --tags --quiet "$REMOTE" || die "could not fetch tags from $REMOTE."
+    if [[ -z "$(git tag --list "v${REL_MAJOR}.${REL_MINOR}.*")" ]]; then
+        die "no base tag for $BRANCH. Tag the release first, e.g.: git tag -a v${REL_MAJOR}.${REL_MINOR}.0 -m \"v${REL_MAJOR}.${REL_MINOR}.0\""
+    fi
+fi
+
+if [[ "$ASSUME_YES" != "1" ]]; then
+    [[ -t 0 ]] || die "no interactive terminal, cannot ask for confirmation. Use -y to skip it."
+fi
+
+# ---------------------------------------------------------------------------
+# Summary and confirmation
+# ---------------------------------------------------------------------------
+
+echo "Branch:  $BRANCH"
+echo "Remote:  $REMOTE"
+echo "Message: $HEADER"
+if [[ -n "$BODY" ]]; then
+    printf '%s\n' "$BODY" | sed 's/^/         /'
+fi
+if (( WILL_TAG )); then
+    echo "Tag:     next patch on v${REL_MAJOR}.${REL_MINOR}.x (created after push)"
+elif (( IS_RELEASE )); then
+    echo "Tag:     none ($CC_TYPE does not trigger a release)"
+fi
+echo
+echo "Changes:"
+git status --short
+echo
+git diff --stat HEAD 2>/dev/null || true
+echo
+
+if [[ "$ASSUME_YES" == "1" ]]; then
+    echo "Confirmation skipped (-y)."
+else
+    read -r -p "Commit and push these changes? [y/N] " ANSWER
+    if [[ ! "$ANSWER" =~ ^[yY]$ ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Stage and check
+# ---------------------------------------------------------------------------
+
+git add -A
+
+# 1) Suspicious file names (only added/copied/modified/renamed, deletions are fine)
+SECRET_PATTERN='(^|/)(\.env(\.[^/]+)?|id_rsa|id_ed25519|[^/]+\.pem|[^/]+\.key|[^/]+\.p12|[^/]+\.pfx|credentials(\.json)?)$'
+SUSPICIOUS="$(git diff --cached --name-only --diff-filter=ACMR \
+    | grep -E "$SECRET_PATTERN" \
+    | grep -Ev '\.(example|sample|template|dist)$' || true)"
+
+if [[ -n "$SUSPICIOUS" ]]; then
+    echo "Error: files that look like secrets are staged:" >&2
+    echo "$SUSPICIOUS" >&2
+    echo "Add them to .gitignore, or commit manually if this is intended." >&2
+    abort_unstaged
+fi
+
+# 2) Secrets inside file contents
+if [[ "${SKIP_GITLEAKS:-0}" != "1" ]]; then
+    if ! gitleaks git --pre-commit --staged --redact --no-banner "$REPO_ROOT"; then
+        echo "Error: gitleaks found possible secrets in the staged changes (see above)." >&2
+        abort_unstaged
+    fi
+fi
+
+# 3) Files too large for GitHub
+MAX_BYTES=$((MAX_FILE_MIB * 1024 * 1024))
+BIG_FILES=""
+while IFS= read -r -d '' FILE; do
+    SIZE="$(git cat-file -s ":$FILE")"
+    if (( SIZE >= MAX_BYTES )); then
+        BIG_FILES+="  $FILE ($((SIZE / 1024 / 1024)) MiB)"$'\n'
+    fi
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+if [[ -n "$BIG_FILES" ]]; then
+    echo "Error: files of ${MAX_FILE_MIB} MiB or more are staged:" >&2
+    printf '%s' "$BIG_FILES" >&2
+    echo "Use Git LFS or add them to .gitignore." >&2
+    abort_unstaged
+fi
+
+# ---------------------------------------------------------------------------
+# Commit and push
+# ---------------------------------------------------------------------------
+
+if ! git commit -m "$MESSAGE"; then
+    unstage_all
+    die "commit failed (hook or message rejected). Changes were unstaged, nothing is lost."
+fi
+
+if git rev-parse --abbrev-ref --symbolic-full-name "@{u}" >/dev/null 2>&1; then
+    if ! git pull --rebase; then
+        echo "Error: rebase onto $REMOTE failed, probably a conflict." >&2
+        echo "Your commit is safe. Resolve the conflicts, then run:" >&2
+        echo "  git rebase --continue && git push" >&2
+        echo "Or undo the pull with:" >&2
+        echo "  git rebase --abort" >&2
+        exit 1
+    fi
+    git push
+else
+    git push -u "$REMOTE" "$BRANCH"
+fi
+
+# ---------------------------------------------------------------------------
+# Release tag (after rebase and push, so it points to the final commit)
+# ---------------------------------------------------------------------------
+
+if (( WILL_TAG )); then
+    git fetch --tags --quiet "$REMOTE" || die "commit pushed, but could not fetch tags. Tag manually."
+
+    LAST_PATCH="$(git tag --list "v${REL_MAJOR}.${REL_MINOR}.*" \
+        | sed -E "s/^v${REL_MAJOR}\.${REL_MINOR}\.//" \
+        | grep -E '^[0-9]+$' \
+        | sort -n \
+        | tail -n1 || true)"
+    [[ -n "$LAST_PATCH" ]] || die "commit pushed, but no valid v${REL_MAJOR}.${REL_MINOR}.N tag found. Tag manually."
+
+    TAG="v${REL_MAJOR}.${REL_MINOR}.$((LAST_PATCH + 1))"
+
+    if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+        die "commit pushed, but tag $TAG already exists. Tag manually."
+    fi
+
+    git tag -a "$TAG" -m "$TAG: $HEADER"
+
+    if ! git push "$REMOTE" "refs/tags/$TAG"; then
+        echo "Error: commit pushed, but pushing tag $TAG failed." >&2
+        echo "Retry with: git push $REMOTE refs/tags/$TAG" >&2
+        exit 1
+    fi
+
+    echo "Released $TAG"
+fi

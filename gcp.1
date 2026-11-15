@@ -1,0 +1,226 @@
+'\" t
+.TH GCP 1 "2026-11-15" "gcp 1.0" "User Commands"
+.nh
+.ds AD l
+.SH NAME
+gcp \- stage, commit and push all changes in one step, with safety checks
+.SH SYNOPSIS
+.B gcp
+.RB [ \-y | \-\-yes ]
+.RB \(dq \fItype\fR[\fB(\fIscope\fB)\fR][\fB!\fR]\fB:\fR
+.RI [ gitmoji ]
+.IR description \(dq
+.SH DESCRIPTION
+.B gcp
+stages all changes in the current repository, runs safety checks, commits
+them with a Conventional Commits message and pushes the branch.
+On
+.BI release/ X . Y
+branches it also creates and pushes a patch version tag for
+.B fix
+commits.
+.PP
+Before anything is staged,
+.B gcp
+shows the branch, remote, final commit message and the list of changed
+files, and asks for confirmation.
+.PP
+The message must be passed as exactly one quoted argument.
+.SH COMMIT MESSAGE
+The header must follow Conventional Commits 1.0.0:
+.PP
+.RS
+.IB type ( scope )!: " description"
+.RE
+.PP
+Allowed types:
+.BR feat ", " fix ", " build ", " chore ", " ci ", " docs ", " style ,
+.BR refactor ", " perf ", " test ", " revert .
+The scope and the
+.B !
+are optional. The header may be at most 72 characters long.
+.PP
+A breaking change is marked either with
+.B !
+before the colon or with a
+.B BREAKING CHANGE:
+footer in the message body.
+.SH GITMOJI
+A gitmoji is inserted after the colon, based on the type.
+The commit gets the unicode emoji, shown here by its shortcode:
+.PP
+.RS
+.TS
+l l.
+feat	:sparkles:
+fix	:bug:
+docs	:memo:
+style	:art:
+refactor	:recycle:
+perf	:zap:
+test	:white_check_mark:
+build	:package:
+ci	:construction_worker:
+chore	:wrench:
+revert	:rewind:
+breaking	:boom:
+.TE
+.RE
+.PP
+If the description already starts with a gitmoji, as unicode or as
+.I :shortcode:
+(for example
+.BR :bug: ),
+it is kept as is.
+.SH SAFETY CHECKS
+.B gcp
+refuses to run, or stops before committing, when:
+.IP \(bu 2
+the message is not valid Conventional Commits, or the header is too long
+.IP \(bu 2
+a rebase, merge or cherry-pick is in progress
+.IP \(bu 2
+HEAD is detached
+.IP \(bu 2
+the branch is
+.B main
+or
+.B master
+(see
+.BR ALLOW_MAIN )
+.IP \(bu 2
+there is no remote, or several remotes and no upstream
+.IP \(bu 2
+stdin is not an interactive terminal
+.IP \(bu 2
+staged files look like secrets by name
+.RB ( .env ", " id_rsa ", " *.pem ", " *.key ", " *.p12 ", " *.pfx ,
+.BR credentials.json ).
+Files ending in
+.BR .example ", " .sample ", " .template " or " .dist
+are allowed, and deleting such files is always allowed
+.IP \(bu 2
+.BR gitleaks (1)
+finds secrets in the staged content
+.IP \(bu 2
+a staged file is 100 MiB or larger (GitHub rejects such files)
+.IP \(bu 2
+a commit hook rejects the commit
+.PP
+Whenever a check fails after staging, all changes are unstaged again.
+Nothing in the working tree is lost.
+.SH PUSH
+If the branch has an upstream,
+.B gcp
+runs
+.B git pull \-\-rebase
+before pushing. On a conflict it stops and prints how to continue
+.RB ( "git rebase \-\-continue" )
+or undo
+.RB ( "git rebase \-\-abort" ).
+The commit itself is never lost.
+.PP
+If the branch has no upstream yet, it is pushed with
+.BR "git push \-u" .
+.SH RELEASE TAGS
+Tags are only created on branches named
+.BI release/ X . Y
+(for example
+.BR release/1.4 ).
+Other names under
+.B release/
+are rejected.
+.TP
+.B fix
+creates the next patch tag, for example
+.B v1.4.3
+after
+.BR v1.4.2 ,
+and pushes it. The tag is created after the rebase and push, so it always
+points to the commit that is on the remote.
+.TP
+.BR feat " or breaking change"
+rejected. New features need a new minor release branch, breaking changes a
+new major release branch.
+.TP
+all other types
+committed and pushed without a tag.
+.PP
+The first tag of a release line
+.RB ( v \fIX\fB.\fIY\fB.0 )
+must be created manually when the release branch is created. Without it,
+.B gcp
+stops before committing.
+.SH OPTIONS
+.TP
+.BR \-y ", " \-\-yes
+Skip the confirmation prompt. Needed when no interactive terminal is
+available (scripts, editors, AI agents). The summary is still printed.
+.SH ENVIRONMENT
+.TP
+.B GCP_YES=1
+Same as
+.BR \-y .
+.TP
+.B ALLOW_MAIN=1
+Allow committing directly to
+.B main
+or
+.BR master .
+.TP
+.B SKIP_GITLEAKS=1
+Skip the content secret scan. Not recommended.
+.SH EXIT STATUS
+.TP
+.B 0
+Success, nothing to commit, or aborted by the user.
+.TP
+.B 1
+A check failed or a git command failed.
+.SH EXAMPLES
+Fix on a feature branch:
+.PP
+.RS
+.nf
+$ gcp "fix(api): handle empty response"
+.fi
+.RE
+.PP
+Commit message becomes
+.B "fix(api): \(lqbug emoji\(rq handle empty response"
+(the emoji for
+.BR :bug: ).
+.PP
+Breaking change with footer:
+.PP
+.RS
+.nf
+$ gcp "refactor: new auth flow
+
+BREAKING CHANGE: login endpoint moved to /v2/login"
+.fi
+.RE
+.PP
+Patch release on a release branch:
+.PP
+.RS
+.nf
+$ git switch release/1.4
+$ gcp "fix: correct timezone in export"
+\&...
+Released v1.4.3
+.fi
+.RE
+.SH REQUIREMENTS
+bash >= 4, git >= 2.22,
+.BR gitleaks (1)
+>= 8.19.
+.SH SEE ALSO
+.BR git-commit (1),
+.BR git-push (1),
+.BR git-tag (1),
+.BR gitleaks (1)
+.PP
+Conventional Commits: https://www.conventionalcommits.org/en/v1.0.0/
+.br
+gitmoji: https://gitmoji.dev
