@@ -1,6 +1,6 @@
 # gcp
 
-Stage, commit and push all changes in one step, with safety checks.
+Stage, commit and push your changes in one step, with safety checks. All changes, or only the files you name.
 
 ```console
 $ gcp "fix(api): handle empty response"
@@ -23,7 +23,8 @@ Commit and push these changes? [y/N] y
 - **Secret protection:** files like `.env` or `id_rsa` are blocked by name, and [gitleaks](https://github.com/gitleaks/gitleaks) scans the staged content.
 - **Large file check:** files of 100 MiB or more are rejected, because GitHub would reject them.
 - **Safe on failure:** when a check fails after staging, all changes are unstaged again and nothing in the working tree is lost.
-- **Rebase before push:** if the branch has an upstream, `gcp` runs `git pull --rebase` first.
+- **Single files or all changes:** commit everything, or only the paths you name.
+- **Rebase before push:** if the branch has an upstream, `gcp` runs `git pull --rebase --autostash` first, so other uncommitted changes are kept.
 - **Release tagging:** a `fix` on `release/X.Y` creates and pushes the next patch tag.
 
 ## Requirements
@@ -73,10 +74,12 @@ unalias gcp 2>/dev/null
 ## Usage
 
 ```sh
-gcp [-y|--yes] "<type>[(scope)][!]: [gitmoji] <description>"
+gcp [-y|--yes] "<type>[(scope)][!]: [gitmoji] <description>" [--] [path...]
 ```
 
-The message must be passed as **one quoted argument**. A body and footers go on further lines inside the same quotes.
+The message must be passed as **one quoted argument**, before any paths. A body and footers go on further lines inside the same quotes.
+
+Without paths, `gcp` commits **all** changes. With paths, only those files and directories are staged, checked and committed. Everything else stays as it is, even if it is already staged.
 
 | Option / variable | Effect |
 | --- | --- |
@@ -104,6 +107,12 @@ Fix on a feature branch:
 ```sh
 gcp "fix(api): handle empty response"
 # -> fix(api): 🐛 handle empty response
+```
+
+Only some files or directories:
+
+```sh
+gcp "docs: update install notes" README.md docs/
 ```
 
 Own gitmoji, kept as is:

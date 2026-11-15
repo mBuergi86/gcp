@@ -10,9 +10,13 @@ gcp \- stage, commit and push all changes in one step, with safety checks
 .RB \(dq \fItype\fR[\fB(\fIscope\fB)\fR][\fB!\fR]\fB:\fR
 .RI [ gitmoji ]
 .IR description \(dq
+.RB [ \-\- ]
+.RI [ path ...]
 .SH DESCRIPTION
 .B gcp
-stages all changes in the current repository, runs safety checks, commits
+stages all changes in the current repository (or only the given
+.IR path s),
+runs safety checks, commits
 them with a Conventional Commits message and pushes the branch.
 On
 .BI release/ X . Y
@@ -25,7 +29,16 @@ Before anything is staged,
 shows the branch, remote, final commit message and the list of changed
 files, and asks for confirmation.
 .PP
-The message must be passed as exactly one quoted argument.
+The message must be passed as exactly one quoted argument, before any paths.
+.PP
+If one or more
+.I path
+arguments are given, only those files and directories are staged, checked
+and committed. Other changes, staged or not, stay untouched. Each path must
+exist or be tracked by git (a deleted tracked file is allowed).
+A
+.B \-\-
+before the paths is optional and allows paths starting with a dash.
 .SH COMMIT MESSAGE
 The header must follow Conventional Commits 1.0.0:
 .PP
@@ -115,8 +128,9 @@ Nothing in the working tree is lost.
 If the branch has an upstream,
 .B gcp
 runs
-.B git pull \-\-rebase
-before pushing. On a conflict it stops and prints how to continue
+.B git pull \-\-rebase \-\-autostash
+before pushing. Uncommitted changes outside the committed paths are stashed
+and restored automatically. On a conflict it stops and prints how to continue
 .RB ( "git rebase \-\-continue" )
 or undo
 .RB ( "git rebase \-\-abort" ).
@@ -180,6 +194,14 @@ Success, nothing to commit, or aborted by the user.
 .B 1
 A check failed or a git command failed.
 .SH EXAMPLES
+Commit only some files:
+.PP
+.RS
+.nf
+$ gcp "docs: update install notes" README.md docs/
+.fi
+.RE
+.PP
 Fix on a feature branch:
 .PP
 .RS

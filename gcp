@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # gcp - stage, commit and push all changes in one step, with safety checks.
 #
-# Usage: gcp [-y|--yes] "<type>[(scope)][!]: [gitmoji] <description>"
+# Usage: gcp [-y|--yes] "<type>[(scope)][!]: [gitmoji] <description>" [--] [path...]
 #   -y, --yes   skip the confirmation prompt (also: GCP_YES=1)
+#   path...     commit only these files/directories (default: all changes)
 #   e.g. gcp "fix(api): handle empty response"
 #        -> fix(api): 🐛 handle empty response
 #
@@ -48,9 +49,20 @@ die() {
     exit 1
 }
 
+# Paths given on the command line; empty means "all changes"
+PATHS=()
+# "-- path..." for git commands, or nothing. Expand with ${PATHSPEC[@]+"${PATHSPEC[@]}"}
+PATHSPEC=()
+
 unstage_all() {
-    # Works on normal branches and on a fresh repo without commits
-    git reset -q 2>/dev/null || git rm -r -q --cached . >/dev/null 2>&1 || true
+    # Works on normal branches and on a fresh repo without commits.
+    # With paths, only those are unstaged, other staged changes are kept.
+    if (( ${#PATHS[@]} )); then
+        git reset -q -- "${PATHS[@]}" 2>/dev/null \
+            || git rm -r -q --cached --ignore-unmatch -- "${PATHS[@]}" >/dev/null 2>&1 || true
+    else
+        git reset -q 2>/dev/null || git rm -r -q --cached . >/dev/null 2>&1 || true
+    fi
 }
 
 abort_unstaged() {
@@ -76,9 +88,18 @@ if [[ "${1:-}" == "-y" || "${1:-}" == "--yes" ]]; then
     shift
 fi
 
-if [[ $# -ne 1 ]]; then
-    die "usage: $(basename "$0") [-y|--yes] \"<type>[(scope)][!]: <description>\" (quote the message)"
+if [[ $# -lt 1 ]]; then
+    die "usage: $(basename "$0") [-y|--yes] \"<type>[(scope)][!]: <description>\" [--] [path...] (quote the message)"
 fi
+
+MESSAGE_ARG="$1"
+shift
+[[ "${1:-}" == "--" ]] && shift
+if [[ $# -gt 0 ]]; then
+    PATHS=("$@")
+    PATHSPEC=(-- "$@")
+fi
+set -- "$MESSAGE_ARG"
 
 # Trim leading and trailing whitespace
 RAW_MESSAGE="$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
@@ -155,8 +176,19 @@ if [[ -d "$GIT_DIR/rebase-merge" || -d "$GIT_DIR/rebase-apply" \
     die "a rebase, merge or cherry-pick is in progress. Finish or abort it first."
 fi
 
-if [[ -z "$(git status --porcelain)" ]]; then
-    echo "Nothing to commit."
+# Every path must exist or be tracked (a tracked file may be deleted)
+for P in ${PATHS[@]+"${PATHS[@]}"}; do
+    if [[ ! -e "$P" ]] && ! git ls-files --error-unmatch -- "$P" >/dev/null 2>&1; then
+        die "path not found and not tracked by git: $P (did you forget to quote the message?)"
+    fi
+done
+
+if [[ -z "$(git status --porcelain ${PATHSPEC[@]+"${PATHSPEC[@]}"})" ]]; then
+    if (( ${#PATHS[@]} )); then
+        echo "Nothing to commit in the given paths."
+    else
+        echo "Nothing to commit."
+    fi
     exit 0
 fi
 
@@ -224,6 +256,9 @@ fi
 
 echo "Branch:  $BRANCH"
 echo "Remote:  $REMOTE"
+if (( ${#PATHS[@]} )); then
+    echo "Paths:   ${PATHS[*]} (other changes are not committed)"
+fi
 echo "Message: $HEADER"
 if [[ -n "$BODY" ]]; then
     printf '%s\n' "$BODY" | sed 's/^/         /'
@@ -235,9 +270,9 @@ elif (( IS_RELEASE )); then
 fi
 echo
 echo "Changes:"
-git status --short
+git status --short ${PATHSPEC[@]+"${PATHSPEC[@]}"}
 echo
-git diff --stat HEAD 2>/dev/null || true
+git diff --stat HEAD ${PATHSPEC[@]+"${PATHSPEC[@]}"} 2>/dev/null || true
 echo
 
 if [[ "$ASSUME_YES" == "1" ]]; then
@@ -254,11 +289,11 @@ fi
 # Stage and check
 # ---------------------------------------------------------------------------
 
-git add -A
+git add -A ${PATHSPEC[@]+"${PATHSPEC[@]}"}
 
 # 1) Suspicious file names (only added/copied/modified/renamed, deletions are fine)
 SECRET_PATTERN='(^|/)(\.env(\.[^/]+)?|id_rsa|id_ed25519|[^/]+\.pem|[^/]+\.key|[^/]+\.p12|[^/]+\.pfx|credentials(\.json)?)$'
-SUSPICIOUS="$(git diff --cached --name-only --diff-filter=ACMR \
+SUSPICIOUS="$(git diff --cached --name-only --diff-filter=ACMR ${PATHSPEC[@]+"${PATHSPEC[@]}"} \
     | grep -E "$SECRET_PATTERN" \
     | grep -Ev '\.(example|sample|template|dist)$' || true)"
 
@@ -285,7 +320,7 @@ while IFS= read -r -d '' FILE; do
     if (( SIZE >= MAX_BYTES )); then
         BIG_FILES+="  $FILE ($((SIZE / 1024 / 1024)) MiB)"$'\n'
     fi
-done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+done < <(git diff --cached --name-only --diff-filter=ACMR -z ${PATHSPEC[@]+"${PATHSPEC[@]}"})
 
 if [[ -n "$BIG_FILES" ]]; then
     echo "Error: files of ${MAX_FILE_MIB} MiB or more are staged:" >&2
@@ -298,13 +333,16 @@ fi
 # Commit and push
 # ---------------------------------------------------------------------------
 
-if ! git commit -m "$MESSAGE"; then
+# With paths, "git commit -- path..." commits only those paths, even if
+# other changes are already staged.
+if ! git commit -m "$MESSAGE" ${PATHSPEC[@]+"${PATHSPEC[@]}"}; then
     unstage_all
     die "commit failed (hook or message rejected). Changes were unstaged, nothing is lost."
 fi
 
 if git rev-parse --abbrev-ref --symbolic-full-name "@{u}" >/dev/null 2>&1; then
-    if ! git pull --rebase; then
+    # --autostash: changes outside the committed paths stay untouched
+    if ! git pull --rebase --autostash; then
         echo "Error: rebase onto $REMOTE failed, probably a conflict." >&2
         echo "Your commit is safe. Resolve the conflicts, then run:" >&2
         echo "  git rebase --continue && git push" >&2
