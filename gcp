@@ -76,11 +76,13 @@ abort_unstaged() {
     exit 1
 }
 
-# True if the word is a gitmoji shortcode (:bug:) or contains non-ASCII (unicode emoji)
+# True if the word is a gitmoji shortcode (:bug:) or starts with a unicode emoji.
+# Checked on UTF-8 bytes: U+1Fxxx (F0 9F ..) and symbols U+2190-U+2BFF (E2 86..AF ..).
+# Letters like Ü, é or ß are not emoji.
 is_emoji() {
     local word="$1"
     [[ "$word" =~ ^:[a-z0-9_+-]+:$ ]] && return 0
-    printf '%s' "$word" | LC_ALL=C grep -q '[^ -~]'
+    LC_ALL=C grep -qE $'^(\xF0\x9F|\xE2[\x86-\xAF])' <<< "$word"
 }
 
 # ---------------------------------------------------------------------------
@@ -362,7 +364,8 @@ CC_BANG="${BASH_REMATCH[3]}"
 DESCRIPTION="${BASH_REMATCH[4]}"
 
 IS_BREAKING=0
-if [[ -n "$CC_BANG" ]] || printf '%s\n' "$BODY" | grep -Eq '^BREAKING[ -]CHANGE: '; then
+BREAKING_RE=$'(^|\n)BREAKING[ -]CHANGE: '
+if [[ -n "$CC_BANG" ]] || [[ "$BODY" =~ $BREAKING_RE ]]; then
     IS_BREAKING=1
 fi
 
@@ -389,7 +392,7 @@ else
 fi
 
 if (( ${#HEADER} > MAX_HEADER_LENGTH )); then
-    die "commit header is ${#HEADER} characters, max is ${MAX_HEADER_LENGTH}."
+    die "commit header is ${#HEADER} characters (including the gitmoji), max is ${MAX_HEADER_LENGTH}: $HEADER"
 fi
 
 # ---------------------------------------------------------------------------
@@ -502,10 +505,6 @@ select_files() {
     PATHSPEC=(-- "${PATHS[@]}")
 }
 
-if (( INTERACTIVE )); then
-    select_files
-fi
-
 # Every path must exist, be in the index, or be in HEAD (deleted/renamed away)
 for P in ${PATHS[@]+"${PATHS[@]}"}; do
     if [[ ! -e "$P" ]] && ! git ls-files --error-unmatch -- "$P" >/dev/null 2>&1 \
@@ -579,6 +578,11 @@ fi
 
 if [[ "$ASSUME_YES" != "1" ]]; then
     [[ -t 0 ]] || die "no interactive terminal, cannot ask for confirmation. Use -y to skip it."
+fi
+
+# Pick files only now, after all checks that could still refuse the commit
+if (( INTERACTIVE )); then
+    select_files
 fi
 
 # ---------------------------------------------------------------------------
@@ -687,16 +691,30 @@ fi
 if git rev-parse --abbrev-ref --symbolic-full-name "@{u}" >/dev/null 2>&1; then
     # --autostash: changes outside the committed paths stay untouched
     if ! git pull --rebase --autostash; then
-        echo "Error: rebase onto $REMOTE failed, probably a conflict." >&2
-        echo "Your commit is safe. Resolve the conflicts, then run:" >&2
-        echo "  git rebase --continue && git push" >&2
-        echo "Or undo the pull with:" >&2
-        echo "  git rebase --abort" >&2
+        if [[ -d "$GIT_DIR/rebase-merge" || -d "$GIT_DIR/rebase-apply" ]]; then
+            echo "Error: rebase onto $REMOTE failed because of a conflict." >&2
+            echo "Your commit is safe. Resolve the conflicts, then run:" >&2
+            echo "  git rebase --continue && git push" >&2
+            echo "Or undo the pull with:" >&2
+            echo "  git rebase --abort" >&2
+        else
+            echo "Error: could not pull from $REMOTE (network, access or missing branch?)." >&2
+            echo "The commit was created locally and is safe. Push later with:" >&2
+            echo "  git pull --rebase && git push" >&2
+        fi
         exit 1
     fi
-    git push
+    PUSH_CMD=(git push)
 else
-    git push -u "$REMOTE" "$BRANCH"
+    PUSH_CMD=(git push -u "$REMOTE" "$BRANCH")
+fi
+
+if ! "${PUSH_CMD[@]}"; then
+    echo "Error: push to $REMOTE failed." >&2
+    echo "The commit was created locally and is safe. Retry with:" >&2
+    echo "  ${PUSH_CMD[*]}" >&2
+    (( WILL_TAG )) && echo "No release tag was created. Run gcp again after a fix, or tag manually." >&2
+    exit 1
 fi
 
 # ---------------------------------------------------------------------------
