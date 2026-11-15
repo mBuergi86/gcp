@@ -34,18 +34,37 @@ Commit and push these changes? [y/N] y
 
 ## Installation
 
+From a clone:
+
 ```sh
 git clone https://github.com/mBuergi86/gcp.git
 cd gcp
-install -Dm755 gcp ~/.local/bin/gcp
-install -Dm644 gcp.1 ~/.local/share/man/man1/gcp.1
+./install.sh
 ```
 
-Make sure `~/.local/bin` is in your `PATH`. Afterwards `man gcp` shows the full manual.
+Or in one line, without cloning:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mBuergi86/gcp/main/install.sh | bash
+```
+
+This installs `gcp` to `~/.local/bin` and the man page to `~/.local/share/man/man1`, so no root is needed. The installer checks the requirements and warns if `~/.local/bin` is not in your `PATH`. Afterwards `man gcp` shows the full manual.
+
+| Option | Effect |
+| --- | --- |
+| `--prefix DIR` | Install to `DIR/bin` and `DIR/share/man/man1` instead, e.g. `sudo ./install.sh --prefix /usr/local` |
+| `--zshrc` | Add `unalias gcp` to `~/.zshrc` (see below) |
+| `--uninstall` | Remove `gcp` and its man page again |
+
+With the one-line install, pass options after `bash -s --`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mBuergi86/gcp/main/install.sh | bash -s -- --zshrc
+```
 
 ### oh-my-zsh users
 
-The oh-my-zsh `git` plugin defines `gcp` as an alias for `git cherry-pick`, which hides the script. Add this line **at the end** of your `~/.zshrc`:
+The oh-my-zsh `git` plugin defines `gcp` as an alias for `git cherry-pick`, which hides the script. The installer detects this and warns you. Run it with `--zshrc`, or add this line **at the end** of your `~/.zshrc` yourself:
 
 ```zsh
 unalias gcp 2>/dev/null
