@@ -23,7 +23,7 @@ Commit and push these changes? [y/N] y
 - **Secret protection:** files like `.env` or `id_rsa` are blocked by name, and [gitleaks](https://github.com/gitleaks/gitleaks) scans the staged content.
 - **Large file check:** files of 100 MiB or more are rejected, because GitHub would reject them.
 - **Safe on failure:** when a check fails after staging, all changes are unstaged again and nothing in the working tree is lost.
-- **Single files or all changes:** commit everything, or only the paths you name.
+- **Single files or all changes:** commit everything, only the paths you name, or pick files interactively (`-i`, with fzf if installed).
 - **Rebase before push:** if the branch has an upstream, `gcp` runs `git pull --rebase --autostash` first, so other uncommitted changes are kept.
 - **Release tagging:** a `fix` on `release/X.Y` creates and pushes the next patch tag.
 
@@ -74,7 +74,7 @@ unalias gcp 2>/dev/null
 ## Usage
 
 ```sh
-gcp [-y|--yes] "<type>[(scope)][!]: [gitmoji] <description>" [--] [path...]
+gcp [-y|--yes] [-i|--interactive] "<type>[(scope)][!]: [gitmoji] <description>" [--] [path...]
 ```
 
 The message must be passed as **one quoted argument**, before any paths. A body and footers go on further lines inside the same quotes.
@@ -83,9 +83,27 @@ Without paths, `gcp` commits **all** changes. With paths, only those files and d
 
 | Option / variable | Effect |
 | --- | --- |
+| `-i`, `--interactive` | Pick the files to commit from a list (see below). |
 | `-y`, `--yes`, `GCP_YES=1` | Skip the confirmation prompt (needed without an interactive terminal, e.g. in scripts, editors or AI agents). The summary is still printed. |
 | `ALLOW_MAIN=1` | Allow committing directly to `main` or `master`. |
 | `SKIP_GITLEAKS=1` | Skip the content secret scan. Not recommended. |
+
+### Interactive selection
+
+`gcp -i` lists all changed files and lets you pick the ones to commit.
+
+- **With [fzf](https://github.com/junegunn/fzf):** a fuzzy finder with a diff preview opens. `TAB` selects, `ctrl-a` toggles all, `ENTER` confirms, `ESC` aborts.
+- **Without fzf:** a numbered list is shown. Type e.g. `1 3 5-7`, or `a` for all.
+
+```text
+Changed files:
+    1)  M src/api.js
+    2) ?? src/new.js
+    3) D  old.txt
+Select files (e.g. 1 3 5-7, a = all, empty = abort): 1 3
+```
+
+For a renamed file the old path is committed too. `-i` needs an interactive terminal and cannot be combined with paths.
 
 ### Commit types and gitmoji
 
@@ -107,6 +125,12 @@ Fix on a feature branch:
 ```sh
 gcp "fix(api): handle empty response"
 # -> fix(api): 🐛 handle empty response
+```
+
+Pick files interactively:
+
+```sh
+gcp -i "fix: correct typos"
 ```
 
 Only some files or directories:

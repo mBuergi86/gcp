@@ -7,6 +7,7 @@ gcp \- stage, commit and push all changes in one step, with safety checks
 .SH SYNOPSIS
 .B gcp
 .RB [ \-y | \-\-yes ]
+.RB [ \-i | \-\-interactive ]
 .RB \(dq \fItype\fR[\fB(\fIscope\fB)\fR][\fB!\fR]\fB:\fR
 .RI [ gitmoji ]
 .IR description \(dq
@@ -169,6 +170,30 @@ must be created manually when the release branch is created. Without it,
 stops before committing.
 .SH OPTIONS
 .TP
+.BR \-i ", " \-\-interactive
+Pick the files to commit from a list of all changed files.
+With
+.BR fzf (1)
+installed, a fuzzy finder with a diff preview opens:
+.B TAB
+selects,
+.B ctrl\-a
+toggles all,
+.B ENTER
+confirms,
+.B ESC
+aborts.
+Without fzf, a numbered list is shown and the selection is typed in,
+for example
+.B 1 3 5\-7
+or
+.B a
+for all.
+For a renamed file the old path is committed too.
+Cannot be combined with
+.I path
+arguments. Needs an interactive terminal.
+.TP
 .BR \-y ", " \-\-yes
 Skip the confirmation prompt. Needed when no interactive terminal is
 available (scripts, editors, AI agents). The summary is still printed.
@@ -194,6 +219,14 @@ Success, nothing to commit, or aborted by the user.
 .B 1
 A check failed or a git command failed.
 .SH EXAMPLES
+Pick the files interactively:
+.PP
+.RS
+.nf
+$ gcp \-i "fix: correct typos"
+.fi
+.RE
+.PP
 Commit only some files:
 .PP
 .RS
