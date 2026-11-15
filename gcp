@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# gcp - stage, commit and push all changes in one step, with safety checks.
+# gcp - stage, commit and push in one step, with safety checks.
 #
-# Usage: gcp [-y|--yes] "<type>[(scope)][!]: [gitmoji] <description>" [--] [path...]
+# Usage:
+#   gcp [-y] [-i] "<type>[(scope)][!]: [gitmoji] <description>" [--] [path...]
+#   gcp amend [-y] [-i] [-m "<message>"] [--] [path...]
+#   gcp undo [-y]
+#   gcp status
+#   gcp history [n] [type]
+#
 #   -y, --yes          skip the confirmation prompt (also: GCP_YES=1)
 #   -i, --interactive  pick the files to commit from a list (fzf if installed)
-#        gcp status | gcp history [n] [type]
 #   path...            commit only these files/directories (default: all changes)
-#   e.g. gcp "fix(api): handle empty response"
-#        -> fix(api): 🐛 handle empty response
 #
 # Commit messages must follow Conventional Commits 1.0.0:
 #   https://www.conventionalcommits.org/en/v1.0.0/
@@ -24,11 +27,13 @@
 # Env overrides:
 #   ALLOW_MAIN=1      allow committing directly to main/master
 #   SKIP_GITLEAKS=1   skip the content secret scan (not recommended)
+#   GCP_NO_FZF=1      use the numbered list for -i even if fzf is installed
 set -euo pipefail
 
 MAX_FILE_MIB=100
 MAX_HEADER_LENGTH=72
 CC_TYPES='feat|fix|build|chore|ci|docs|style|refactor|perf|test|revert'
+CC_REGEX="^(${CC_TYPES})(\([a-z0-9._/-]+\))?(!)?: ([^[:space:]].*)$"
 # File names that look like secrets (files ending in .example/.sample/.template/.dist are allowed)
 SECRET_PATTERN='(^|/)(\.env(\.[^/]+)?|id_rsa|id_ed25519|[^/]+\.pem|[^/]+\.key|[^/]+\.p12|[^/]+\.pfx|credentials(\.json)?)$'
 SECRET_ALLOWED='\.(example|sample|template|dist)$'
@@ -49,45 +54,31 @@ declare -A GITMOJI=(
 )
 GITMOJI_BREAKING="💥"
 
+if [[ -t 1 ]]; then
+    C_RESET=$'\e[0m'; C_DIM=$'\e[2m'; C_BOLD=$'\e[1m'
+    C_YELLOW=$'\e[33m'; C_GREEN=$'\e[32m'; C_RED=$'\e[31m'
+else
+    C_RESET=""; C_DIM=""; C_BOLD=""; C_YELLOW=""; C_GREEN=""; C_RED=""
+fi
+
+# Global state, set by the option parser and the helpers below
+ASSUME_YES="${GCP_YES:-0}"
+INTERACTIVE=0
+PATHS=()      # paths to commit; empty means "all changes"
+PATHSPEC=()   # "-- path..." for git, or nothing. Expand with ${PATHSPEC[@]+"${PATHSPEC[@]}"}
+GIT_DIR=""
+REPO_ROOT=""
+BRANCH=""
+REMOTE=""
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
 die() {
     echo "Error: $*" >&2
     exit 1
 }
-
-# Paths given on the command line; empty means "all changes"
-PATHS=()
-# "-- path..." for git commands, or nothing. Expand with ${PATHSPEC[@]+"${PATHSPEC[@]}"}
-PATHSPEC=()
-
-unstage_all() {
-    # Works on normal branches and on a fresh repo without commits.
-    # With paths, only those are unstaged, other staged changes are kept.
-    if (( ${#PATHS[@]} )); then
-        git reset -q -- "${PATHS[@]}" 2>/dev/null \
-            || git rm -r -q --cached --ignore-unmatch -- "${PATHS[@]}" >/dev/null 2>&1 || true
-    else
-        git reset -q 2>/dev/null || git rm -r -q --cached . >/dev/null 2>&1 || true
-    fi
-}
-
-abort_unstaged() {
-    unstage_all
-    echo "Nothing was committed, changes were unstaged." >&2
-    exit 1
-}
-
-# True if the word is a gitmoji shortcode (:bug:) or starts with a unicode emoji.
-# Checked on UTF-8 bytes: U+1Fxxx (F0 9F ..) and symbols U+2190-U+2BFF (E2 86..AF ..).
-# Letters like Ü, é or ß are not emoji.
-is_emoji() {
-    local word="$1"
-    [[ "$word" =~ ^:[a-z0-9_+-]+:$ ]] && return 0
-    LC_ALL=C grep -qE $'^(\xF0\x9F|\xE2[\x86-\xAF])' <<< "$word"
-}
-
-# ---------------------------------------------------------------------------
-# Arguments and commit message
-# ---------------------------------------------------------------------------
 
 show_help() {
     cat <<'EOF'
@@ -95,6 +86,9 @@ gcp - stage, commit and push in one step, with safety checks
 
 Usage:
   gcp [options] "<type>[(scope)][!]: <description>" [--] [path...]
+  gcp amend [options] [-m "<message>"] [--] [path...]
+                              add changes to the last commit (only if not pushed)
+  gcp undo [-y]               undo the last commit (reset if local, revert if pushed)
   gcp status                  show branch, changes and what gcp would block
   gcp history [n] [type]      show the last n commits (default 10), optional type filter
 
@@ -110,6 +104,7 @@ Environment:
   ALLOW_MAIN=1        allow committing directly to main/master
   SKIP_GITLEAKS=1     skip the secret scan (not recommended)
   GCP_YES=1           same as -y
+  GCP_NO_FZF=1        use the numbered list for -i even if fzf is installed
 
 Types (gitmoji is added automatically):
   feat ✨  fix 🐛  docs 📝  style 🎨  refactor ♻️  perf ⚡️
@@ -120,6 +115,8 @@ Examples:
   gcp "fix(api): handle empty response"
   gcp "docs: update install notes" README.md docs/
   gcp -i "refactor: clean up helpers"
+  gcp amend forgotten-file.txt
+  gcp undo
   gcp history 20 fix
   ALLOW_MAIN=1 gcp "chore: bump version"
 
@@ -128,37 +125,742 @@ More: man gcp
 EOF
 }
 
-ASSUME_YES="${GCP_YES:-0}"
-INTERACTIVE=0
-USAGE="usage: $(basename "$0") [-y|--yes] [-i|--interactive] \"<type>[(scope)][!]: <description>\" [--] [path...] (quote the message)
-       $(basename "$0") status | history [n] [type] | -h"
+USAGE="usage: gcp [-y] [-i] \"<type>[(scope)][!]: <description>\" [--] [path...] (quote the message)
+       gcp amend [-y] [-i] [-m \"<message>\"] [--] [path...]
+       gcp undo [-y] | status | history [n] [type] | -h"
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -y|--yes)          ASSUME_YES=1; shift ;;
-        -i|--interactive)  INTERACTIVE=1; shift ;;
-        -iy|-yi)           ASSUME_YES=1; INTERACTIVE=1; shift ;;
-        -h|--help)         show_help; exit 0 ;;
-        -*)                die "unknown option: $1
-$USAGE" ;;
-        *)                 break ;;
-    esac
-done
-
-# ---------------------------------------------------------------------------
-# Subcommands: status, history (read-only)
-# ---------------------------------------------------------------------------
-
-if [[ -t 1 ]]; then
-    C_RESET=$'\e[0m'; C_DIM=$'\e[2m'; C_BOLD=$'\e[1m'
-    C_YELLOW=$'\e[33m'; C_GREEN=$'\e[32m'; C_RED=$'\e[31m'; C_CYAN=$'\e[36m'
-else
-    C_RESET=""; C_DIM=""; C_BOLD=""; C_YELLOW=""; C_GREEN=""; C_RED=""; C_CYAN=""
-fi
+# True if the word is a gitmoji shortcode (:bug:) or starts with a unicode emoji.
+# Checked on UTF-8 bytes: U+1Fxxx (F0 9F ..) and symbols U+2190-U+2BFF (E2 86..AF ..).
+# Letters like Ü, é or ß are not emoji.
+is_emoji() {
+    local word="$1"
+    [[ "$word" =~ ^:[a-z0-9_+-]+:$ ]] && return 0
+    LC_ALL=C grep -qE $'^(\xF0\x9F|\xE2[\x86-\xAF])' <<< "$word"
+}
 
 require_repo() {
     git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not a git repository."
+    GIT_DIR="$(git rev-parse --git-dir)"
+    REPO_ROOT="$(git rev-parse --show-toplevel)"
 }
+
+require_commits() {
+    git rev-parse -q --verify HEAD >/dev/null || die "there are no commits yet."
+}
+
+require_tools() {
+    if [[ "${SKIP_GITLEAKS:-0}" != "1" ]]; then
+        command -v gitleaks >/dev/null 2>&1 \
+            || die "gitleaks not found. Install it or run with SKIP_GITLEAKS=1."
+        gitleaks git --help >/dev/null 2>&1 \
+            || die "gitleaks is too old (needs >= 8.19 for 'gitleaks git')."
+    fi
+}
+
+# Prints the operation in progress (rebase, merge, cherry-pick, revert) or nothing
+operation_in_progress() {
+    if [[ -d "$GIT_DIR/rebase-merge" || -d "$GIT_DIR/rebase-apply" ]]; then
+        echo "rebase"
+    elif [[ -f "$GIT_DIR/MERGE_HEAD" ]]; then
+        echo "merge"
+    elif [[ -f "$GIT_DIR/CHERRY_PICK_HEAD" ]]; then
+        echo "cherry-pick"
+    elif [[ -f "$GIT_DIR/REVERT_HEAD" ]]; then
+        echo "revert"
+    fi
+}
+
+require_no_operation() {
+    local op
+    op="$(operation_in_progress)"
+    [[ -z "$op" ]] || die "a $op is in progress. Finish or abort it first."
+}
+
+require_branch() {
+    BRANCH="$(git branch --show-current)"
+    [[ -n "$BRANCH" ]] || die "detached HEAD, check out a branch first."
+    if [[ "$BRANCH" == "main" || "$BRANCH" == "master" ]] && [[ "${ALLOW_MAIN:-0}" != "1" ]]; then
+        die "refusing to commit directly to $BRANCH. Use a feature or release branch, or run with ALLOW_MAIN=1."
+    fi
+}
+
+# Upstream remote first, otherwise the only configured remote
+require_remote() {
+    REMOTE="$(git config --get "branch.$BRANCH.remote" || true)"
+    if [[ -z "$REMOTE" ]]; then
+        local -a remotes=()
+        mapfile -t remotes < <(git remote)
+        case ${#remotes[@]} in
+            0) die "no remote configured." ;;
+            1) REMOTE="${remotes[0]}" ;;
+            *) die "multiple remotes and no upstream for $BRANCH. Push once manually: git push -u <remote> $BRANCH" ;;
+        esac
+    fi
+}
+
+require_tty_for_confirm() {
+    if [[ "$ASSUME_YES" != "1" ]]; then
+        [[ -t 0 ]] || die "no interactive terminal, cannot ask for confirmation. Use -y to skip it."
+    fi
+}
+
+# confirm "<question>": exits with "Aborted." unless answered y (or -y given)
+confirm() {
+    if [[ "$ASSUME_YES" == "1" ]]; then
+        echo "Confirmation skipped (-y)."
+        return 0
+    fi
+    local answer
+    read -r -p "$1 [y/N] " answer
+    if [[ ! "$answer" =~ ^[yY]$ ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+}
+
+# True if the commit is on any remote-tracking branch (as of the last fetch)
+is_pushed() {
+    [[ -n "$(git for-each-ref --count=1 --contains "$1" refs/remotes 2>/dev/null)" ]]
+}
+
+is_merge_commit() {
+    git rev-parse -q --verify "$1^2" >/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Commit message
+# ---------------------------------------------------------------------------
+
+# parse_message "<raw message>"
+# Validates Conventional Commits, adds the gitmoji and sets
+# CC_TYPE, IS_BREAKING, HEADER, BODY and MESSAGE.
+parse_message() {
+    local raw raw_header description first_word rest
+    raw="$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [[ -n "$raw" ]] || die "commit message is empty."
+
+    raw_header="$(printf '%s\n' "$raw" | head -n1)"
+    # Body without leading blank lines (re-added as exactly one separator below)
+    BODY="$(printf '%s\n' "$raw" | tail -n +2 | sed '/./,$!d')"
+
+    if [[ ! "$raw_header" =~ $CC_REGEX ]]; then
+        {
+            echo "Error: commit message does not follow Conventional Commits."
+            echo "  Got:      $raw_header"
+            echo "  Expected: <type>[(scope)][!]: <description>"
+            echo "  Types:    ${CC_TYPES//|/, }"
+            echo "  Example:  fix(api): handle empty response"
+        } >&2
+        exit 1
+    fi
+
+    CC_TYPE="${BASH_REMATCH[1]}"
+    local cc_scope="${BASH_REMATCH[2]}" cc_bang="${BASH_REMATCH[3]}"
+    description="${BASH_REMATCH[4]}"
+
+    IS_BREAKING=0
+    local breaking_re=$'(^|\n)BREAKING[ -]CHANGE: '
+    if [[ -n "$cc_bang" ]] || [[ "$BODY" =~ $breaking_re ]]; then
+        IS_BREAKING=1
+    fi
+
+    # Gitmoji: keep the user's own, otherwise add one based on type
+    first_word="${description%% *}"
+    if is_emoji "$first_word"; then
+        rest="${description#"$first_word"}"
+        rest="${rest#"${rest%%[![:space:]]*}"}"
+        [[ -n "$rest" ]] || die "description is missing after the gitmoji."
+    elif (( IS_BREAKING )); then
+        description="$GITMOJI_BREAKING $description"
+    else
+        description="${GITMOJI[$CC_TYPE]} $description"
+    fi
+
+    HEADER="${CC_TYPE}${cc_scope}${cc_bang}: ${description}"
+    if [[ -n "$BODY" ]]; then
+        # Git needs a blank line between subject and body/footer
+        MESSAGE="${HEADER}"$'\n\n'"${BODY}"
+    else
+        MESSAGE="$HEADER"
+    fi
+
+    if (( ${#HEADER} > MAX_HEADER_LENGTH )); then
+        die "commit header is ${#HEADER} characters (including the gitmoji), max is ${MAX_HEADER_LENGTH}: $HEADER"
+    fi
+}
+
+# Sets IS_RELEASE, WILL_TAG, REL_MAJOR, REL_MINOR; dies on forbidden types
+check_release_rules() {
+    IS_RELEASE=0
+    WILL_TAG=0
+    REL_MAJOR=""
+    REL_MINOR=""
+    [[ "$BRANCH" == release/* ]] || return 0
+
+    if [[ ! "$BRANCH" =~ ^release/([0-9]+)\.([0-9]+)$ ]]; then
+        die "release branches must be named release/X.Y (e.g. release/1.4), got: $BRANCH"
+    fi
+    IS_RELEASE=1
+    REL_MAJOR="${BASH_REMATCH[1]}"
+    REL_MINOR="${BASH_REMATCH[2]}"
+
+    if (( IS_BREAKING )); then
+        die "breaking changes are not allowed on $BRANCH. They need a new major release branch."
+    fi
+    if [[ "$CC_TYPE" == "feat" ]]; then
+        die "feat is not allowed on $BRANCH. New features need a new minor release branch."
+    fi
+    if [[ "$CC_TYPE" == "fix" ]]; then
+        WILL_TAG=1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Paths and file selection
+# ---------------------------------------------------------------------------
+
+set_paths() {
+    PATHS=("$@")
+    if (( $# )); then
+        PATHSPEC=(-- "$@")
+    else
+        PATHSPEC=()
+    fi
+}
+
+# Every path must exist, be in the index, or be in HEAD (deleted/renamed away)
+validate_paths() {
+    local p
+    for p in ${PATHS[@]+"${PATHS[@]}"}; do
+        if [[ ! -e "$p" ]] && ! git ls-files --error-unmatch -- "$p" >/dev/null 2>&1 \
+            && [[ -z "$(git ls-tree --name-only HEAD -- "$p" 2>/dev/null)" ]]; then
+            die "path not found and not tracked by git: $p (did you forget to quote the message?)"
+        fi
+    done
+}
+
+has_changes() {
+    [[ -n "$(git status --porcelain ${PATHSPEC[@]+"${PATHSPEC[@]}"})" ]]
+}
+
+# Sets PATHS/PATHSPEC from a list of changed files the user picks.
+select_files() {
+    [[ -t 0 && -t 1 ]] || die "-i needs an interactive terminal."
+
+    # Changed files as "XY path" (renames also add the old path)
+    local -a status=() files=() old=()
+    local entry xy
+    while IFS= read -r -d '' entry; do
+        xy="${entry:0:2}"
+        status+=("$xy")
+        files+=("${entry:3}")
+        if [[ "$xy" == R* || "$xy" == C* ]]; then
+            IFS= read -r -d '' entry
+            old+=("$entry")
+        else
+            old+=("")
+        fi
+    done < <(git status --porcelain=v1 -z --untracked-files=all)
+
+    (( ${#files[@]} )) || { echo "Nothing to commit."; exit 0; }
+
+    local -a picked=()
+    local i
+    if [[ "${GCP_NO_FZF:-0}" != "1" ]] && command -v fzf >/dev/null 2>&1; then
+        local preview line
+        # Diff against HEAD; untracked files (or a repo without commits) as new file.
+        # The single quotes are intended: the preview shell expands this, not gcp.
+        # shellcheck disable=SC2016
+        preview='out="$(git diff --color=always HEAD -- {3} 2>/dev/null)"; '
+        # shellcheck disable=SC2016
+        preview+='if [ -n "$out" ]; then printf "%s\n" "$out"; '
+        preview+='else git diff --color=always --no-index /dev/null {3} 2>/dev/null; [ $? -le 1 ] || echo "(no preview)"; fi'
+        while IFS= read -r -d '' line; do
+            picked+=("${line%%$'\t'*}")
+        done < <(
+            for i in "${!files[@]}"; do
+                printf '%s\t%s\t%s\0' "$i" "${status[$i]}" "${files[$i]}"
+            done | SHELL='sh' fzf --multi --read0 --print0 --delimiter=$'\t' --with-nth=2.. \
+                --header='TAB: select   ctrl-a: all   ENTER: confirm   ESC: abort' \
+                --bind='ctrl-a:toggle-all' \
+                --prompt='Files to commit> ' \
+                --preview="$preview" --preview-window='right,60%,wrap' \
+            || true
+        )
+    else
+        echo "Changed files:"
+        for i in "${!files[@]}"; do
+            printf '  %3d) %s %s\n' "$((i + 1))" "${status[$i]}" "${files[$i]}"
+        done
+        echo
+        local answer token from to n
+        read -r -p "Select files (e.g. 1 3 5-7, a = all, empty = abort): " answer
+        if [[ "$answer" =~ ^[[:space:]]*[aA][[:space:]]*$ ]]; then
+            picked=("${!files[@]}")
+        else
+            for token in ${answer//,/ }; do
+                if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                    from="${BASH_REMATCH[1]}"; to="${BASH_REMATCH[2]}"
+                elif [[ "$token" =~ ^[0-9]+$ ]]; then
+                    from="$token"; to="$token"
+                else
+                    die "invalid selection: $token"
+                fi
+                (( from >= 1 && to <= ${#files[@]} && from <= to )) \
+                    || die "selection out of range: $token (1-${#files[@]})"
+                for (( n = from; n <= to; n++ )); do
+                    picked+=("$((n - 1))")
+                done
+            done
+        fi
+    fi
+
+    if (( ${#picked[@]} == 0 )); then
+        echo "No files selected. Aborted."
+        exit 0
+    fi
+
+    # Deduplicate, keep order; renames bring their old path along
+    local -A seen=()
+    local -a chosen=()
+    for i in "${picked[@]}"; do
+        [[ -n "${seen[$i]:-}" ]] && continue
+        seen[$i]=1
+        chosen+=("${files[$i]}")
+        if [[ -n "${old[$i]}" ]]; then
+            chosen+=("${old[$i]}")
+        fi
+    done
+    set_paths "${chosen[@]}"
+}
+
+show_changes() {
+    echo "Changes:"
+    git --no-pager status --short ${PATHSPEC[@]+"${PATHSPEC[@]}"}
+    echo
+    git --no-pager diff --stat HEAD ${PATHSPEC[@]+"${PATHSPEC[@]}"} 2>/dev/null || true
+    echo
+}
+
+# ---------------------------------------------------------------------------
+# Staging and checks
+# ---------------------------------------------------------------------------
+
+unstage_paths() {
+    # Works on normal branches and on a fresh repo without commits.
+    # With paths, only those are unstaged, other staged changes are kept.
+    if (( ${#PATHS[@]} )); then
+        git reset -q -- "${PATHS[@]}" 2>/dev/null \
+            || git rm -r -q --cached --ignore-unmatch -- "${PATHS[@]}" >/dev/null 2>&1 || true
+    else
+        git reset -q 2>/dev/null || git rm -r -q --cached . >/dev/null 2>&1 || true
+    fi
+}
+
+abort_unstaged() {
+    unstage_paths
+    echo "Nothing was committed, changes were unstaged." >&2
+    exit 1
+}
+
+stage_changes() {
+    if (( ${#PATHS[@]} )); then
+        # Paths that are only in HEAD (deletion already staged) cannot be added,
+        # "git commit -- path" picks them up anyway.
+        local -a add_paths=()
+        local p
+        for p in "${PATHS[@]}"; do
+            if [[ -e "$p" ]] || git ls-files --error-unmatch -- "$p" >/dev/null 2>&1; then
+                add_paths+=("$p")
+            fi
+        done
+        if (( ${#add_paths[@]} )); then
+            git add -A -- "${add_paths[@]}"
+        fi
+    else
+        git add -A
+    fi
+}
+
+# Secret names, secret contents (gitleaks), file size. Unstages and exits on failure.
+check_staged() {
+    # 1) Suspicious file names (only added/copied/modified/renamed, deletions are fine)
+    local suspicious
+    suspicious="$(git diff --cached --name-only --diff-filter=ACMR ${PATHSPEC[@]+"${PATHSPEC[@]}"} \
+        | grep -E "$SECRET_PATTERN" \
+        | grep -Ev "$SECRET_ALLOWED" || true)"
+    if [[ -n "$suspicious" ]]; then
+        echo "Error: files that look like secrets are staged:" >&2
+        echo "$suspicious" >&2
+        echo "Add them to .gitignore, or commit manually if this is intended." >&2
+        abort_unstaged
+    fi
+
+    # 2) Secrets inside file contents
+    if [[ "${SKIP_GITLEAKS:-0}" != "1" ]]; then
+        if ! gitleaks git --pre-commit --staged --redact --no-banner "$REPO_ROOT"; then
+            echo "Error: gitleaks found possible secrets in the staged changes (see above)." >&2
+            abort_unstaged
+        fi
+    fi
+
+    # 3) Files too large for GitHub
+    local max_bytes=$((MAX_FILE_MIB * 1024 * 1024)) big="" file size
+    while IFS= read -r -d '' file; do
+        size="$(git cat-file -s ":$file")"
+        if (( size >= max_bytes )); then
+            big+="  $file ($((size / 1024 / 1024)) MiB)"$'\n'
+        fi
+    done < <(git diff --cached --name-only --diff-filter=ACMR -z ${PATHSPEC[@]+"${PATHSPEC[@]}"})
+    if [[ -n "$big" ]]; then
+        echo "Error: files of ${MAX_FILE_MIB} MiB or more are staged:" >&2
+        printf '%s' "$big" >&2
+        echo "Use Git LFS or add them to .gitignore." >&2
+        abort_unstaged
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Push
+# ---------------------------------------------------------------------------
+
+# Pull --rebase (if there is an upstream) and push. Exits with a clear message on failure.
+push_branch() {
+    local -a push_cmd
+    if git rev-parse --abbrev-ref --symbolic-full-name "@{u}" >/dev/null 2>&1; then
+        # --autostash: changes outside the committed paths stay untouched
+        if ! git pull --rebase --autostash; then
+            if [[ -d "$GIT_DIR/rebase-merge" || -d "$GIT_DIR/rebase-apply" ]]; then
+                echo "Error: rebase onto $REMOTE failed because of a conflict." >&2
+                echo "Your commit is safe. Resolve the conflicts, then run:" >&2
+                echo "  git rebase --continue && git push" >&2
+                echo "Or undo the pull with:" >&2
+                echo "  git rebase --abort" >&2
+            else
+                echo "Error: could not pull from $REMOTE (network, access or missing branch?)." >&2
+                echo "The commit was created locally and is safe. Push later with:" >&2
+                echo "  git pull --rebase && git push" >&2
+            fi
+            exit 1
+        fi
+        push_cmd=(git push)
+    else
+        push_cmd=(git push -u "$REMOTE" "$BRANCH")
+    fi
+
+    if ! "${push_cmd[@]}"; then
+        echo "Error: push to $REMOTE failed." >&2
+        echo "The commit was created locally and is safe. Retry with:" >&2
+        echo "  ${push_cmd[*]}" >&2
+        if (( ${WILL_TAG:-0} )); then
+            echo "No release tag was created. Tag manually after pushing." >&2
+        fi
+        exit 1
+    fi
+}
+
+create_release_tag() {
+    git fetch --tags --quiet "$REMOTE" || die "commit pushed, but could not fetch tags. Tag manually."
+
+    local last tag
+    last="$(git tag --list "v${REL_MAJOR}.${REL_MINOR}.*" \
+        | sed -E "s/^v${REL_MAJOR}\.${REL_MINOR}\.//" \
+        | grep -E '^[0-9]+$' \
+        | sort -n \
+        | tail -n1 || true)"
+    [[ -n "$last" ]] || die "commit pushed, but no valid v${REL_MAJOR}.${REL_MINOR}.N tag found. Tag manually."
+
+    tag="v${REL_MAJOR}.${REL_MINOR}.$((last + 1))"
+    if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+        die "commit pushed, but tag $tag already exists. Tag manually."
+    fi
+
+    git tag -a "$tag" -m "$tag: $HEADER"
+    if ! git push "$REMOTE" "refs/tags/$tag"; then
+        echo "Error: commit pushed, but pushing tag $tag failed." >&2
+        echo "Retry with: git push $REMOTE refs/tags/$tag" >&2
+        exit 1
+    fi
+    echo "Released $tag"
+}
+
+# ---------------------------------------------------------------------------
+# gcp "<message>" [path...]
+# ---------------------------------------------------------------------------
+
+cmd_commit() {
+    local message_arg="$1"
+    shift
+    [[ "${1:-}" == "--" ]] && shift
+    if (( $# )); then
+        (( INTERACTIVE )) && die "-i and paths cannot be combined. Use one of them."
+        set_paths "$@"
+    fi
+
+    parse_message "$message_arg"
+    require_repo
+    require_tools
+    require_no_operation
+    validate_paths
+
+    if ! has_changes; then
+        if (( ${#PATHS[@]} )); then
+            echo "Nothing to commit in the given paths."
+        else
+            echo "Nothing to commit."
+        fi
+        exit 0
+    fi
+
+    require_branch
+    require_remote
+    check_release_rules
+
+    # Make sure the release line has a base tag before committing
+    if (( WILL_TAG )); then
+        git fetch --tags --quiet "$REMOTE" || die "could not fetch tags from $REMOTE."
+        if [[ -z "$(git tag --list "v${REL_MAJOR}.${REL_MINOR}.*")" ]]; then
+            die "no base tag for $BRANCH. Tag the release first, e.g.: git tag -a v${REL_MAJOR}.${REL_MINOR}.0 -m \"v${REL_MAJOR}.${REL_MINOR}.0\""
+        fi
+    fi
+
+    require_tty_for_confirm
+    # Pick files only now, after all checks that could still refuse the commit
+    if (( INTERACTIVE )); then
+        select_files
+    fi
+
+    echo "Branch:  $BRANCH"
+    echo "Remote:  $REMOTE"
+    if (( ${#PATHS[@]} )); then
+        echo "Paths:   ${PATHS[*]} (other changes are not committed)"
+    fi
+    echo "Message: $HEADER"
+    if [[ -n "$BODY" ]]; then
+        printf '%s\n' "$BODY" | sed 's/^/         /'
+    fi
+    if (( WILL_TAG )); then
+        echo "Tag:     next patch on v${REL_MAJOR}.${REL_MINOR}.x (created after push)"
+    elif (( IS_RELEASE )); then
+        echo "Tag:     none ($CC_TYPE does not trigger a release)"
+    fi
+    echo
+    show_changes
+    confirm "Commit and push these changes?"
+
+    stage_changes
+    check_staged
+
+    # With paths, "git commit -- path..." commits only those paths, even if
+    # other changes are already staged.
+    if ! git commit -m "$MESSAGE" ${PATHSPEC[@]+"${PATHSPEC[@]}"}; then
+        unstage_paths
+        die "commit failed (hook or message rejected). Changes were unstaged, nothing is lost."
+    fi
+
+    push_branch
+    if (( WILL_TAG )); then
+        create_release_tag
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# gcp amend [-m "<message>"] [path...]
+# ---------------------------------------------------------------------------
+
+cmd_amend() {
+    local new_message=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -y|--yes)          ASSUME_YES=1; shift ;;
+            -i|--interactive)  INTERACTIVE=1; shift ;;
+            -m|--message)      [[ $# -ge 2 ]] || die "-m needs a message."
+                               new_message="$2"; shift 2 ;;
+            --)                shift; break ;;
+            -*)                die "unknown option for amend: $1" ;;
+            *)                 break ;;
+        esac
+    done
+    if (( $# )); then
+        (( INTERACTIVE )) && die "-i and paths cannot be combined. Use one of them."
+        set_paths "$@"
+    fi
+
+    require_repo
+    require_commits
+    require_no_operation
+    if is_merge_commit HEAD; then
+        die "the last commit is a merge commit, gcp amend does not change merges."
+    fi
+    require_branch
+    require_remote
+
+    if is_pushed HEAD; then
+        die "the last commit is already pushed. Amending would rewrite shared history.
+       Make a new commit instead, or use 'gcp undo' to revert it."
+    fi
+
+    local old_header
+    old_header="$(git log -1 --format=%s)"
+    if [[ -n "$new_message" ]]; then
+        parse_message "$new_message"
+        check_release_rules
+    else
+        BRANCH="$(git branch --show-current)"
+    fi
+    WILL_TAG=0   # tags are only created by a normal gcp commit
+
+    validate_paths
+    local include_changes=0
+    if has_changes; then
+        include_changes=1
+    fi
+    if (( ! include_changes )) && [[ -z "$new_message" ]]; then
+        if (( ${#PATHS[@]} )); then
+            echo "Nothing to amend in the given paths."
+        else
+            echo "Nothing to amend. Change files or pass -m \"<new message>\"."
+        fi
+        exit 0
+    fi
+    if (( include_changes )); then
+        require_tools
+    fi
+
+    require_tty_for_confirm
+    if (( INTERACTIVE && include_changes )); then
+        select_files
+    fi
+
+    echo "Branch:  $BRANCH"
+    echo "Amend:   $(git log -1 --format='%h') $old_header (not pushed yet)"
+    if [[ -n "$new_message" ]]; then
+        echo "Message: $HEADER (new)"
+    else
+        echo "Message: unchanged"
+    fi
+    if (( ${#PATHS[@]} )); then
+        echo "Paths:   ${PATHS[*]} (other changes are not added)"
+    fi
+    echo
+    if (( include_changes )); then
+        show_changes
+    else
+        echo "Changes: none, only the message is changed"
+        echo
+    fi
+    confirm "Amend the last commit and push?"
+
+    local -a commit_args=(--amend)
+    if [[ -n "$new_message" ]]; then
+        commit_args+=(-m "$MESSAGE")
+    else
+        commit_args+=(--no-edit)
+    fi
+
+    if (( include_changes )); then
+        stage_changes
+        check_staged
+        commit_args+=(${PATHSPEC[@]+"${PATHSPEC[@]}"})
+    else
+        # Only the message: do not pick up anything that happens to be staged
+        commit_args+=(--only)
+    fi
+
+    if ! git commit "${commit_args[@]}"; then
+        if (( include_changes )); then
+            unstage_paths
+        fi
+        die "amend failed (hook or message rejected). The previous commit is unchanged."
+    fi
+
+    push_branch
+}
+
+# ---------------------------------------------------------------------------
+# gcp undo
+# ---------------------------------------------------------------------------
+
+cmd_undo() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -y|--yes) ASSUME_YES=1; shift ;;
+            *)        die "usage: gcp undo [-y]" ;;
+        esac
+    done
+
+    require_repo
+    require_commits
+    require_no_operation
+    BRANCH="$(git branch --show-current)"
+    [[ -n "$BRANCH" ]] || die "detached HEAD, check out a branch first."
+    if is_merge_commit HEAD; then
+        die "the last commit is a merge commit. Undo it manually (git revert -m 1 HEAD)."
+    fi
+
+    local hash subject
+    hash="$(git rev-parse HEAD)"
+    subject="$(git log -1 --format=%s)"
+
+    if ! is_pushed HEAD; then
+        # Local only: remove the commit, keep its changes staged
+        local tags
+        tags="$(git tag --points-at HEAD | paste -sd ' ' -)"
+        if [[ -n "$tags" ]]; then
+            die "tag $tags points at the last commit. Delete it first: git tag -d $tags"
+        fi
+
+        require_tty_for_confirm
+        echo "Branch:  $BRANCH"
+        echo "Undo:    ${hash:0:7} $subject"
+        echo "         not pushed yet: the commit is removed, its changes stay staged."
+        echo
+        confirm "Undo the last commit?"
+
+        if git rev-parse -q --verify HEAD~1 >/dev/null; then
+            git reset -q --soft HEAD~1
+        else
+            # First commit of the repository: keep the index, drop the branch ref
+            git update-ref -d HEAD
+        fi
+        echo "Undone. The changes are staged again, see: gcp status"
+        return 0
+    fi
+
+    # Already pushed: create and push a revert commit
+    require_branch
+    require_remote
+    git diff --cached --quiet \
+        || die "there are staged changes. Commit or unstage them first (git restore --staged .)."
+
+    HEADER="revert: ${GITMOJI[revert]} $subject"
+    MESSAGE="${HEADER}"$'\n\n'"This reverts commit $hash."
+    WILL_TAG=0
+
+    require_tty_for_confirm
+    echo "Branch:  $BRANCH"
+    echo "Remote:  $REMOTE"
+    echo "Undo:    ${hash:0:7} $subject"
+    echo "         already pushed: a new commit reverts its changes."
+    echo "Message: $HEADER"
+    echo
+    confirm "Create and push the revert commit?"
+
+    if ! git revert --no-commit HEAD; then
+        git revert --abort 2>/dev/null || true
+        die "the revert conflicts with your local changes. Commit or stash them first."
+    fi
+    if ! git commit -q -m "$MESSAGE"; then
+        git revert --abort 2>/dev/null || true
+        die "revert commit failed (hook rejected?). Nothing was changed."
+    fi
+    echo "Reverted ${hash:0:7}."
+    push_branch
+}
+
+# ---------------------------------------------------------------------------
+# gcp status
+# ---------------------------------------------------------------------------
 
 cmd_status() {
     [[ $# -eq 0 ]] || die "usage: gcp status"
@@ -216,14 +918,10 @@ cmd_status() {
     fi
 
     # Operation in progress
-    local gd
-    gd="$(git rev-parse --git-dir)"
-    if [[ -d "$gd/rebase-merge" || -d "$gd/rebase-apply" ]]; then
-        warnings+=("rebase in progress: git rebase --continue or --abort")
-    elif [[ -f "$gd/MERGE_HEAD" ]]; then
-        warnings+=("merge in progress: finish it or git merge --abort")
-    elif [[ -f "$gd/CHERRY_PICK_HEAD" ]]; then
-        warnings+=("cherry-pick in progress: git cherry-pick --continue or --abort")
+    local op
+    op="$(operation_in_progress)"
+    if [[ -n "$op" ]]; then
+        warnings+=("$op in progress: finish it (git $op --continue) or abort it (git $op --abort)")
     fi
 
     # Changes
@@ -237,18 +935,17 @@ cmd_status() {
         git -c color.status="$color" --no-pager status --short | sed 's/^/  /'
 
         # Files gcp would block: secret-like names, too large files
-        local top file size max_bytes=$((MAX_FILE_MIB * 1024 * 1024))
-        top="$(git rev-parse --show-toplevel)"
+        local file size max_bytes=$((MAX_FILE_MIB * 1024 * 1024))
         while IFS= read -r -d '' file; do
-            [[ -f "$top/$file" ]] || continue
+            [[ -f "$REPO_ROOT/$file" ]] || continue
             if [[ "$file" =~ $SECRET_PATTERN ]] && [[ ! "$file" =~ $SECRET_ALLOWED ]]; then
                 warnings+=("$file looks like a secret, add it to .gitignore")
             fi
-            size="$(stat -c %s -- "$top/$file" 2>/dev/null || stat -f %z -- "$top/$file" 2>/dev/null || echo 0)"
+            size="$(stat -c %s -- "$REPO_ROOT/$file" 2>/dev/null || stat -f %z -- "$REPO_ROOT/$file" 2>/dev/null || echo 0)"
             if (( size >= max_bytes )); then
                 warnings+=("$file is $((size / 1024 / 1024)) MiB, use Git LFS or .gitignore")
             fi
-        done < <(git -C "$top" ls-files -z --modified --others --exclude-standard)
+        done < <(git -C "$REPO_ROOT" ls-files -z --modified --others --exclude-standard)
     fi
 
     # Tools
@@ -267,6 +964,10 @@ cmd_status() {
         echo "${C_GREEN}✓ Ready for gcp${C_RESET}"
     fi
 }
+
+# ---------------------------------------------------------------------------
+# gcp history [n] [type]
+# ---------------------------------------------------------------------------
 
 cmd_history() {
     local count=10 filter="" arg
@@ -320,430 +1021,29 @@ cmd_history() {
     done <<< "$out"
 }
 
-case "${1:-}" in
-    status)  shift; cmd_status "$@"; exit 0 ;;
-    history) shift; cmd_history "$@"; exit 0 ;;
-esac
-
-if [[ $# -lt 1 ]]; then
-    die "$USAGE"
-fi
-
-MESSAGE_ARG="$1"
-shift
-[[ "${1:-}" == "--" ]] && shift
-if [[ $# -gt 0 ]]; then
-    (( INTERACTIVE )) && die "-i and paths cannot be combined. Use one of them."
-    PATHS=("$@")
-    PATHSPEC=(-- "$@")
-fi
-set -- "$MESSAGE_ARG"
-
-# Trim leading and trailing whitespace
-RAW_MESSAGE="$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-[[ -n "$RAW_MESSAGE" ]] || die "commit message is empty."
-
-RAW_HEADER="$(printf '%s\n' "$RAW_MESSAGE" | head -n1)"
-# Body without leading blank lines (re-added as exactly one separator below)
-BODY="$(printf '%s\n' "$RAW_MESSAGE" | tail -n +2 | sed '/./,$!d')"
-
-CC_REGEX="^(${CC_TYPES})(\([a-z0-9._/-]+\))?(!)?: ([^[:space:]].*)$"
-
-if [[ ! "$RAW_HEADER" =~ $CC_REGEX ]]; then
-    echo "Error: commit message does not follow Conventional Commits." >&2
-    echo "  Got:      $RAW_HEADER" >&2
-    echo "  Expected: <type>[(scope)][!]: <description>" >&2
-    echo "  Types:    ${CC_TYPES//|/, }" >&2
-    echo "  Example:  fix(api): handle empty response" >&2
-    exit 1
-fi
-
-CC_TYPE="${BASH_REMATCH[1]}"
-CC_SCOPE="${BASH_REMATCH[2]}"
-CC_BANG="${BASH_REMATCH[3]}"
-DESCRIPTION="${BASH_REMATCH[4]}"
-
-IS_BREAKING=0
-BREAKING_RE=$'(^|\n)BREAKING[ -]CHANGE: '
-if [[ -n "$CC_BANG" ]] || [[ "$BODY" =~ $BREAKING_RE ]]; then
-    IS_BREAKING=1
-fi
-
-# Gitmoji: keep the user's own, otherwise add one based on type
-FIRST_WORD="${DESCRIPTION%% *}"
-if is_emoji "$FIRST_WORD"; then
-    REST="${DESCRIPTION#"$FIRST_WORD"}"
-    REST="${REST#"${REST%%[![:space:]]*}"}"
-    [[ -n "$REST" ]] || die "description is missing after the gitmoji."
-else
-    if (( IS_BREAKING )); then
-        DESCRIPTION="$GITMOJI_BREAKING $DESCRIPTION"
-    else
-        DESCRIPTION="${GITMOJI[$CC_TYPE]} $DESCRIPTION"
-    fi
-fi
-
-HEADER="${CC_TYPE}${CC_SCOPE}${CC_BANG}: ${DESCRIPTION}"
-if [[ -n "$BODY" ]]; then
-    # Git needs a blank line between subject and body/footer
-    MESSAGE="${HEADER}"$'\n\n'"${BODY}"
-else
-    MESSAGE="$HEADER"
-fi
-
-if (( ${#HEADER} > MAX_HEADER_LENGTH )); then
-    die "commit header is ${#HEADER} characters (including the gitmoji), max is ${MAX_HEADER_LENGTH}: $HEADER"
-fi
-
 # ---------------------------------------------------------------------------
-# Repository state
+# Main
 # ---------------------------------------------------------------------------
 
-git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not a git repository."
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-
-if [[ "${SKIP_GITLEAKS:-0}" != "1" ]]; then
-    command -v gitleaks >/dev/null 2>&1 \
-        || die "gitleaks not found. Install it or run with SKIP_GITLEAKS=1."
-    gitleaks git --help >/dev/null 2>&1 \
-        || die "gitleaks is too old (needs >= 8.19 for 'gitleaks git')."
-fi
-
-GIT_DIR="$(git rev-parse --git-dir)"
-if [[ -d "$GIT_DIR/rebase-merge" || -d "$GIT_DIR/rebase-apply" \
-   || -f "$GIT_DIR/MERGE_HEAD" || -f "$GIT_DIR/CHERRY_PICK_HEAD" ]]; then
-    die "a rebase, merge or cherry-pick is in progress. Finish or abort it first."
-fi
-
-# ---------------------------------------------------------------------------
-# Interactive file selection (-i)
-# ---------------------------------------------------------------------------
-
-# Sets PATHS/PATHSPEC from a list of changed files the user picks.
-select_files() {
-    [[ -t 0 && -t 1 ]] || die "-i needs an interactive terminal."
-
-    # Changed files as "XY path" (renames also add the old path)
-    local -a STATUS=() FILES=() OLD=()
-    local entry xy path
-    while IFS= read -r -d '' entry; do
-        xy="${entry:0:2}"
-        path="${entry:3}"
-        STATUS+=("$xy")
-        FILES+=("$path")
-        if [[ "$xy" == R* || "$xy" == C* ]]; then
-            IFS= read -r -d '' entry
-            OLD+=("$entry")
-        else
-            OLD+=("")
-        fi
-    done < <(git status --porcelain=v1 -z --untracked-files=all)
-
-    (( ${#FILES[@]} )) || { echo "Nothing to commit."; exit 0; }
-
-    local -a PICKED=()
-    local i
-    if command -v fzf >/dev/null 2>&1; then
-        local preview line
-        # Diff against HEAD; untracked files (or a repo without commits) as new file
-        preview='out="$(git diff --color=always HEAD -- {3} 2>/dev/null)"; '
-        preview+='if [ -n "$out" ]; then printf "%s\n" "$out"; '
-        preview+='else git diff --color=always --no-index /dev/null {3} 2>/dev/null; [ $? -le 1 ] || echo "(no preview)"; fi'
-        while IFS= read -r -d '' line; do
-            PICKED+=("${line%%$'\t'*}")
-        done < <(
-            for i in "${!FILES[@]}"; do
-                printf '%s\t%s\t%s\0' "$i" "${STATUS[$i]}" "${FILES[$i]}"
-            done | SHELL=sh fzf --multi --read0 --print0 --delimiter=$'\t' --with-nth=2.. \
-                --header='TAB: select   ctrl-a: all   ENTER: confirm   ESC: abort' \
-                --bind='ctrl-a:toggle-all' \
-                --prompt='Files to commit> ' \
-                --preview="$preview" --preview-window='right,60%,wrap' \
-            || true
-        )
-    else
-        echo "Changed files:"
-        for i in "${!FILES[@]}"; do
-            printf '  %3d) %s %s\n' "$((i + 1))" "${STATUS[$i]}" "${FILES[$i]}"
-        done
-        echo
-        local answer token from to n
-        read -r -p "Select files (e.g. 1 3 5-7, a = all, empty = abort): " answer
-        if [[ "$answer" =~ ^[[:space:]]*[aA][[:space:]]*$ ]]; then
-            PICKED=("${!FILES[@]}")
-        else
-            for token in ${answer//,/ }; do
-                if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-                    from="${BASH_REMATCH[1]}"; to="${BASH_REMATCH[2]}"
-                elif [[ "$token" =~ ^[0-9]+$ ]]; then
-                    from="$token"; to="$token"
-                else
-                    die "invalid selection: $token"
-                fi
-                (( from >= 1 && to <= ${#FILES[@]} && from <= to )) \
-                    || die "selection out of range: $token (1-${#FILES[@]})"
-                for (( n = from; n <= to; n++ )); do
-                    PICKED+=("$((n - 1))")
-                done
-            done
-        fi
-    fi
-
-    if (( ${#PICKED[@]} == 0 )); then
-        echo "No files selected. Aborted."
-        exit 0
-    fi
-
-    # Deduplicate, keep order; renames bring their old path along
-    local -A SEEN=()
-    for i in "${PICKED[@]}"; do
-        [[ -n "${SEEN[$i]:-}" ]] && continue
-        SEEN[$i]=1
-        PATHS+=("${FILES[$i]}")
-        [[ -n "${OLD[$i]}" ]] && PATHS+=("${OLD[$i]}")
-    done
-    PATHSPEC=(-- "${PATHS[@]}")
-}
-
-# Every path must exist, be in the index, or be in HEAD (deleted/renamed away)
-for P in ${PATHS[@]+"${PATHS[@]}"}; do
-    if [[ ! -e "$P" ]] && ! git ls-files --error-unmatch -- "$P" >/dev/null 2>&1 \
-        && [[ -z "$(git ls-tree --name-only HEAD -- "$P" 2>/dev/null)" ]]; then
-        die "path not found and not tracked by git: $P (did you forget to quote the message?)"
-    fi
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -y|--yes)          ASSUME_YES=1; shift ;;
+        -i|--interactive)  INTERACTIVE=1; shift ;;
+        -iy|-yi)           ASSUME_YES=1; INTERACTIVE=1; shift ;;
+        -h|--help)         show_help; exit 0 ;;
+        --)                shift; break ;;
+        -*)                die "unknown option: $1
+$USAGE" ;;
+        *)                 break ;;
+    esac
 done
 
-if [[ -z "$(git status --porcelain ${PATHSPEC[@]+"${PATHSPEC[@]}"})" ]]; then
-    if (( ${#PATHS[@]} )); then
-        echo "Nothing to commit in the given paths."
-    else
-        echo "Nothing to commit."
-    fi
-    exit 0
-fi
+[[ $# -ge 1 ]] || die "$USAGE"
 
-BRANCH="$(git branch --show-current)"
-[[ -n "$BRANCH" ]] || die "detached HEAD, check out a branch first."
-
-if [[ "$BRANCH" == "main" || "$BRANCH" == "master" ]] && [[ "${ALLOW_MAIN:-0}" != "1" ]]; then
-    die "refusing to commit directly to $BRANCH. Use a feature or release branch, or run with ALLOW_MAIN=1."
-fi
-
-# Resolve remote: upstream remote first, otherwise the only configured remote
-REMOTE="$(git config --get "branch.$BRANCH.remote" || true)"
-if [[ -z "$REMOTE" ]]; then
-    mapfile -t REMOTES < <(git remote)
-    case ${#REMOTES[@]} in
-        0) die "no remote configured." ;;
-        1) REMOTE="${REMOTES[0]}" ;;
-        *) die "multiple remotes and no upstream for $BRANCH. Push once manually: git push -u <remote> $BRANCH" ;;
-    esac
-fi
-
-# ---------------------------------------------------------------------------
-# Release branch rules
-# ---------------------------------------------------------------------------
-
-IS_RELEASE=0
-WILL_TAG=0
-REL_MAJOR=""
-REL_MINOR=""
-
-if [[ "$BRANCH" == release/* ]]; then
-    if [[ ! "$BRANCH" =~ ^release/([0-9]+)\.([0-9]+)$ ]]; then
-        die "release branches must be named release/X.Y (e.g. release/1.4), got: $BRANCH"
-    fi
-    IS_RELEASE=1
-    REL_MAJOR="${BASH_REMATCH[1]}"
-    REL_MINOR="${BASH_REMATCH[2]}"
-
-    if (( IS_BREAKING )); then
-        die "breaking changes are not allowed on $BRANCH. They need a new major release branch."
-    fi
-    if [[ "$CC_TYPE" == "feat" ]]; then
-        die "feat is not allowed on $BRANCH. New features need a new minor release branch."
-    fi
-    if [[ "$CC_TYPE" == "fix" ]]; then
-        WILL_TAG=1
-    fi
-fi
-
-# Fetch tags and make sure the release line has a base tag before committing
-if (( WILL_TAG )); then
-    git fetch --tags --quiet "$REMOTE" || die "could not fetch tags from $REMOTE."
-    if [[ -z "$(git tag --list "v${REL_MAJOR}.${REL_MINOR}.*")" ]]; then
-        die "no base tag for $BRANCH. Tag the release first, e.g.: git tag -a v${REL_MAJOR}.${REL_MINOR}.0 -m \"v${REL_MAJOR}.${REL_MINOR}.0\""
-    fi
-fi
-
-if [[ "$ASSUME_YES" != "1" ]]; then
-    [[ -t 0 ]] || die "no interactive terminal, cannot ask for confirmation. Use -y to skip it."
-fi
-
-# Pick files only now, after all checks that could still refuse the commit
-if (( INTERACTIVE )); then
-    select_files
-fi
-
-# ---------------------------------------------------------------------------
-# Summary and confirmation
-# ---------------------------------------------------------------------------
-
-echo "Branch:  $BRANCH"
-echo "Remote:  $REMOTE"
-if (( ${#PATHS[@]} )); then
-    echo "Paths:   ${PATHS[*]} (other changes are not committed)"
-fi
-echo "Message: $HEADER"
-if [[ -n "$BODY" ]]; then
-    printf '%s\n' "$BODY" | sed 's/^/         /'
-fi
-if (( WILL_TAG )); then
-    echo "Tag:     next patch on v${REL_MAJOR}.${REL_MINOR}.x (created after push)"
-elif (( IS_RELEASE )); then
-    echo "Tag:     none ($CC_TYPE does not trigger a release)"
-fi
-echo
-echo "Changes:"
-git --no-pager status --short ${PATHSPEC[@]+"${PATHSPEC[@]}"}
-echo
-git --no-pager diff --stat HEAD ${PATHSPEC[@]+"${PATHSPEC[@]}"} 2>/dev/null || true
-echo
-
-if [[ "$ASSUME_YES" == "1" ]]; then
-    echo "Confirmation skipped (-y)."
-else
-    read -r -p "Commit and push these changes? [y/N] " ANSWER
-    if [[ ! "$ANSWER" =~ ^[yY]$ ]]; then
-        echo "Aborted."
-        exit 0
-    fi
-fi
-
-# ---------------------------------------------------------------------------
-# Stage and check
-# ---------------------------------------------------------------------------
-
-if (( ${#PATHS[@]} )); then
-    # Paths that are only in HEAD (deletion already staged) cannot be added,
-    # "git commit -- path" picks them up anyway.
-    ADD_PATHS=()
-    for P in "${PATHS[@]}"; do
-        if [[ -e "$P" ]] || git ls-files --error-unmatch -- "$P" >/dev/null 2>&1; then
-            ADD_PATHS+=("$P")
-        fi
-    done
-    if (( ${#ADD_PATHS[@]} )); then
-        git add -A -- "${ADD_PATHS[@]}"
-    fi
-else
-    git add -A
-fi
-
-# 1) Suspicious file names (only added/copied/modified/renamed, deletions are fine)
-SUSPICIOUS="$(git diff --cached --name-only --diff-filter=ACMR ${PATHSPEC[@]+"${PATHSPEC[@]}"} \
-    | grep -E "$SECRET_PATTERN" \
-    | grep -Ev "$SECRET_ALLOWED" || true)"
-
-if [[ -n "$SUSPICIOUS" ]]; then
-    echo "Error: files that look like secrets are staged:" >&2
-    echo "$SUSPICIOUS" >&2
-    echo "Add them to .gitignore, or commit manually if this is intended." >&2
-    abort_unstaged
-fi
-
-# 2) Secrets inside file contents
-if [[ "${SKIP_GITLEAKS:-0}" != "1" ]]; then
-    if ! gitleaks git --pre-commit --staged --redact --no-banner "$REPO_ROOT"; then
-        echo "Error: gitleaks found possible secrets in the staged changes (see above)." >&2
-        abort_unstaged
-    fi
-fi
-
-# 3) Files too large for GitHub
-MAX_BYTES=$((MAX_FILE_MIB * 1024 * 1024))
-BIG_FILES=""
-while IFS= read -r -d '' FILE; do
-    SIZE="$(git cat-file -s ":$FILE")"
-    if (( SIZE >= MAX_BYTES )); then
-        BIG_FILES+="  $FILE ($((SIZE / 1024 / 1024)) MiB)"$'\n'
-    fi
-done < <(git diff --cached --name-only --diff-filter=ACMR -z ${PATHSPEC[@]+"${PATHSPEC[@]}"})
-
-if [[ -n "$BIG_FILES" ]]; then
-    echo "Error: files of ${MAX_FILE_MIB} MiB or more are staged:" >&2
-    printf '%s' "$BIG_FILES" >&2
-    echo "Use Git LFS or add them to .gitignore." >&2
-    abort_unstaged
-fi
-
-# ---------------------------------------------------------------------------
-# Commit and push
-# ---------------------------------------------------------------------------
-
-# With paths, "git commit -- path..." commits only those paths, even if
-# other changes are already staged.
-if ! git commit -m "$MESSAGE" ${PATHSPEC[@]+"${PATHSPEC[@]}"}; then
-    unstage_all
-    die "commit failed (hook or message rejected). Changes were unstaged, nothing is lost."
-fi
-
-if git rev-parse --abbrev-ref --symbolic-full-name "@{u}" >/dev/null 2>&1; then
-    # --autostash: changes outside the committed paths stay untouched
-    if ! git pull --rebase --autostash; then
-        if [[ -d "$GIT_DIR/rebase-merge" || -d "$GIT_DIR/rebase-apply" ]]; then
-            echo "Error: rebase onto $REMOTE failed because of a conflict." >&2
-            echo "Your commit is safe. Resolve the conflicts, then run:" >&2
-            echo "  git rebase --continue && git push" >&2
-            echo "Or undo the pull with:" >&2
-            echo "  git rebase --abort" >&2
-        else
-            echo "Error: could not pull from $REMOTE (network, access or missing branch?)." >&2
-            echo "The commit was created locally and is safe. Push later with:" >&2
-            echo "  git pull --rebase && git push" >&2
-        fi
-        exit 1
-    fi
-    PUSH_CMD=(git push)
-else
-    PUSH_CMD=(git push -u "$REMOTE" "$BRANCH")
-fi
-
-if ! "${PUSH_CMD[@]}"; then
-    echo "Error: push to $REMOTE failed." >&2
-    echo "The commit was created locally and is safe. Retry with:" >&2
-    echo "  ${PUSH_CMD[*]}" >&2
-    (( WILL_TAG )) && echo "No release tag was created. Run gcp again after a fix, or tag manually." >&2
-    exit 1
-fi
-
-# ---------------------------------------------------------------------------
-# Release tag (after rebase and push, so it points to the final commit)
-# ---------------------------------------------------------------------------
-
-if (( WILL_TAG )); then
-    git fetch --tags --quiet "$REMOTE" || die "commit pushed, but could not fetch tags. Tag manually."
-
-    LAST_PATCH="$(git tag --list "v${REL_MAJOR}.${REL_MINOR}.*" \
-        | sed -E "s/^v${REL_MAJOR}\.${REL_MINOR}\.//" \
-        | grep -E '^[0-9]+$' \
-        | sort -n \
-        | tail -n1 || true)"
-    [[ -n "$LAST_PATCH" ]] || die "commit pushed, but no valid v${REL_MAJOR}.${REL_MINOR}.N tag found. Tag manually."
-
-    TAG="v${REL_MAJOR}.${REL_MINOR}.$((LAST_PATCH + 1))"
-
-    if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-        die "commit pushed, but tag $TAG already exists. Tag manually."
-    fi
-
-    git tag -a "$TAG" -m "$TAG: $HEADER"
-
-    if ! git push "$REMOTE" "refs/tags/$TAG"; then
-        echo "Error: commit pushed, but pushing tag $TAG failed." >&2
-        echo "Retry with: git push $REMOTE refs/tags/$TAG" >&2
-        exit 1
-    fi
-
-    echo "Released $TAG"
-fi
+case "$1" in
+    status)  shift; cmd_status "$@" ;;
+    history) shift; cmd_history "$@" ;;
+    undo)    shift; cmd_undo "$@" ;;
+    amend)   shift; cmd_amend "$@" ;;
+    *)       cmd_commit "$@" ;;
+esac

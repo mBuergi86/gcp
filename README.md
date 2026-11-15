@@ -1,5 +1,7 @@
 # gcp
 
+[![test](https://github.com/mBuergi86/gcp/actions/workflows/test.yml/badge.svg)](https://github.com/mBuergi86/gcp/actions/workflows/test.yml)
+
 Stage, commit and push your changes in one step, with safety checks. All changes, or only the files you name.
 
 ```console
@@ -23,6 +25,7 @@ Commit and push these changes? [y/N] y
 - **Secret protection:** files like `.env` or `id_rsa` are blocked by name, and [gitleaks](https://github.com/gitleaks/gitleaks) scans the staged content.
 - **Large file check:** files of 100 MiB or more are rejected, because GitHub would reject them.
 - **Safe on failure:** when a check fails after staging, all changes are unstaged again and nothing in the working tree is lost.
+- **Amend and undo:** `gcp amend` adds a forgotten file to the last commit, `gcp undo` undoes it, with `reset` if local and `revert` if already pushed.
 - **Status and history:** `gcp status` warns before a commit would be blocked, `gcp history` lists commits, filterable by type.
 - **Single files or all changes:** commit everything, only the paths you name, or pick files interactively (`-i`, with fzf if installed).
 - **Rebase before push:** if the branch has an upstream, `gcp` runs `git pull --rebase --autostash` first, so other uncommitted changes are kept.
@@ -80,11 +83,13 @@ gcp [-y|--yes] [-i|--interactive] "<type>[(scope)][!]: [gitmoji] <description>" 
 
 The message must be passed as **one quoted argument**, before any paths. A body and footers go on further lines inside the same quotes.
 
-Two read-only subcommands help before and after committing:
+Subcommands for fixing and checking:
 
 ```sh
-gcp status               # branch, ahead/behind, changes, and what gcp would block
-gcp history [n] [type]   # last n commits (default 10), e.g. "gcp history 20 fix"
+gcp amend [-m "<message>"] [path...]  # add changes to the last commit (if not pushed yet)
+gcp undo                              # undo the last commit, safely
+gcp status                            # branch, ahead/behind, changes, and what gcp would block
+gcp history [n] [type]                # last n commits (default 10), e.g. "gcp history 20 fix"
 ```
 
 Without paths, `gcp` commits **all** changes. With paths, only those files and directories are staged, checked and committed. Everything else stays as it is, even if it is already staged.
@@ -95,6 +100,51 @@ Without paths, `gcp` commits **all** changes. With paths, only those files and d
 | `-y`, `--yes`, `GCP_YES=1` | Skip the confirmation prompt (needed without an interactive terminal, e.g. in scripts, editors or AI agents). The summary is still printed. |
 | `ALLOW_MAIN=1` | Allow committing directly to `main` or `master`. |
 | `SKIP_GITLEAKS=1` | Skip the content secret scan. Not recommended. |
+| `GCP_NO_FZF=1` | Use the numbered list for `-i` even if fzf is installed. |
+
+### gcp amend
+
+```sh
+gcp amend [-y] [-i] [-m "<message>"] [--] [path...]
+```
+
+Adds changes to the last commit and pushes it. Useful for a forgotten file or a small fix right after committing.
+
+| Command | Effect |
+| --- | --- |
+| `gcp amend` | add all changes to the last commit, keep the message |
+| `gcp amend forgotten.txt` | add only this file |
+| `gcp amend -i` | pick the files from a list |
+| `gcp amend -m "fix: better message"` | change the message (with gitmoji, validated); with changes, they are added too |
+
+The same safety checks as for a normal commit apply (secret names, gitleaks, file size, `main`).
+
+`gcp amend` only works if the last commit is **not pushed yet**. Changing a pushed commit would rewrite history that others may already have, so `gcp` refuses and suggests a new commit or `gcp undo` instead.
+
+### gcp undo
+
+```sh
+gcp undo [-y]
+```
+
+Undoes the last commit, and picks the safe way automatically:
+
+| Last commit is… | What happens |
+| --- | --- |
+| **not pushed yet** | The commit is removed, its changes stay staged (`git reset --soft`). Nothing is lost, you can fix and commit again. |
+| **already pushed** | A new commit `revert: ⏪️ <original message>` reverses the changes and is pushed. The history stays intact for everyone. |
+
+```text
+$ gcp undo
+Branch:  feature/api
+Undo:    8af7e58 fix(api): 🐛 handle empty response
+         not pushed yet: the commit is removed, its changes stay staged.
+
+Undo the last commit? [y/N] y
+Undone. The changes are staged again, see: gcp status
+```
+
+Merge commits are refused, they need `git revert -m 1 HEAD` by hand. Whether a commit is pushed is decided from the remote-tracking branches, as of the last fetch.
 
 ### gcp status
 
@@ -274,6 +324,18 @@ Released v1.4.1
 ```
 
 The tag is created after the rebase and push, so it always points to the commit that is on the remote.
+
+## Development
+
+Tests use [bats](https://github.com/bats-core/bats-core), every test runs in its own temporary repository with a local remote. [shellcheck](https://www.shellcheck.net) checks the scripts.
+
+```sh
+sudo pacman -S bats shellcheck   # Arch; Debian/Ubuntu: sudo apt install bats shellcheck
+shellcheck gcp install.sh
+bats test/
+```
+
+GitHub Actions runs both on every push and pull request.
 
 ## Exit status
 

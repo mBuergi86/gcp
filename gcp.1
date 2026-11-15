@@ -14,6 +14,17 @@ gcp \- stage, commit and push all changes in one step, with safety checks
 .RB [ \-\- ]
 .RI [ path ...]
 .br
+.B gcp amend
+.RB [ \-y ]
+.RB [ \-i ]
+.RB [ \-m
+.IR message ]
+.RB [ \-\- ]
+.RI [ path ...]
+.br
+.B gcp undo
+.RB [ \-y ]
+.br
 .B gcp status
 .br
 .B gcp history
@@ -47,7 +58,31 @@ A
 .B \-\-
 before the paths is optional and allows paths starting with a dash.
 .SH SUBCOMMANDS
-Both subcommands only show information and change nothing.
+.TP
+.B amend \fR[\fB\-m\fR \fImessage\fR] [\fIpath\fR...]
+Adds changes to the last commit and pushes it, for a forgotten file or a
+typo. Without paths all changes are added, with paths only those, with
+.B \-i
+the files are picked from a list.
+.B \-m
+replaces the message (validated and given a gitmoji like a normal commit);
+without changes, only the message is changed.
+The same safety checks as for a normal commit apply.
+Only allowed if the last commit is not pushed yet, because amending a
+pushed commit would rewrite shared history. Merge commits are refused.
+.TP
+.B undo
+Undoes the last commit.
+If it is not pushed yet, it is removed and its changes stay staged
+.RB ( "git reset \-\-soft" ).
+If it is already pushed, a
+.B revert
+commit that reverses its changes is created and pushed, so the shared
+history stays intact. Merge commits are refused.
+Whether a commit is pushed is decided from the remote-tracking branches,
+as of the last fetch.
+.PP
+The following two subcommands only show information and change nothing.
 .TP
 .B status
 Shows the branch, its upstream and how many commits it is ahead or behind
@@ -237,6 +272,11 @@ available (scripts, editors, AI agents). The summary is still printed.
 Show a short overview of options, types and examples.
 .SH ENVIRONMENT
 .TP
+.B GCP_NO_FZF=1
+Use the numbered list for
+.B \-i
+even if fzf is installed.
+.TP
 .B GCP_YES=1
 Same as
 .BR \-y .
@@ -257,6 +297,15 @@ Success, nothing to commit, or aborted by the user.
 .B 1
 A check failed or a git command failed.
 .SH EXAMPLES
+Add a forgotten file to the last commit, then undo a commit:
+.PP
+.RS
+.nf
+$ gcp amend forgotten.txt
+$ gcp undo
+.fi
+.RE
+.PP
 Check before committing, look at the last fixes:
 .PP
 .RS
