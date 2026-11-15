@@ -83,6 +83,42 @@ is_emoji() {
 # Arguments and commit message
 # ---------------------------------------------------------------------------
 
+show_help() {
+    cat <<'EOF'
+gcp - stage, commit and push in one step, with safety checks
+
+Usage:
+  gcp [options] "<type>[(scope)][!]: <description>" [--] [path...]
+
+  Without paths, all changes are committed. With paths, only those.
+  The message must be quoted and comes before the paths.
+
+Options:
+  -i, --interactive   pick the files from a list (fzf with diff preview if installed)
+  -y, --yes           skip the confirmation prompt
+  -h, --help          show this help
+
+Environment:
+  ALLOW_MAIN=1        allow committing directly to main/master
+  SKIP_GITLEAKS=1     skip the secret scan (not recommended)
+  GCP_YES=1           same as -y
+
+Types (gitmoji is added automatically):
+  feat ✨  fix 🐛  docs 📝  style 🎨  refactor ♻️  perf ⚡️
+  test ✅  build 📦️  ci 👷  chore 🔧  revert ⏪️  breaking 💥
+  Breaking change: "feat!: ..." or a "BREAKING CHANGE: ..." footer.
+
+Examples:
+  gcp "fix(api): handle empty response"
+  gcp "docs: update install notes" README.md docs/
+  gcp -i "refactor: clean up helpers"
+  ALLOW_MAIN=1 gcp "chore: bump version"
+
+On release/X.Y branches, a fix creates the next patch tag (vX.Y.Z).
+More: man gcp
+EOF
+}
+
 ASSUME_YES="${GCP_YES:-0}"
 INTERACTIVE=0
 USAGE="usage: $(basename "$0") [-y|--yes] [-i|--interactive] \"<type>[(scope)][!]: <description>\" [--] [path...] (quote the message)"
@@ -92,7 +128,7 @@ while [[ $# -gt 0 ]]; do
         -y|--yes)          ASSUME_YES=1; shift ;;
         -i|--interactive)  INTERACTIVE=1; shift ;;
         -iy|-yi)           ASSUME_YES=1; INTERACTIVE=1; shift ;;
-        -h|--help)         echo "$USAGE"; echo "See 'man gcp' for details."; exit 0 ;;
+        -h|--help)         show_help; exit 0 ;;
         -*)                die "unknown option: $1
 $USAGE" ;;
         *)                 break ;;
