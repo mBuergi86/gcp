@@ -96,9 +96,13 @@ Without paths, `gcp` commits **all** changes. With paths, only those files and d
 | `ALLOW_MAIN=1` | Allow committing directly to `main` or `master`. |
 | `SKIP_GITLEAKS=1` | Skip the content secret scan. Not recommended. |
 
-### Status and history
+### gcp status
 
-`gcp status` shows where you are and warns about everything `gcp` would block, before you try to commit:
+```sh
+gcp status
+```
+
+Shows where you are and warns about everything `gcp` would block, **before** you try to commit. It only reads, nothing is changed and nothing is fetched from the network.
 
 ```text
 Branch:  feature/api → origin/feature/api (2 ahead, 0 behind, as of last fetch)
@@ -106,12 +110,47 @@ Branch:  feature/api → origin/feature/api (2 ahead, 0 behind, as of last fetch
 Changes:
    M src/api.js
   ?? .env
+  ?? video.mp4
 
 Warnings:
   ⚠ .env looks like a secret, add it to .gitignore
+  ⚠ video.mp4 is 230 MiB, use Git LFS or .gitignore
 ```
 
-`gcp history` lists the last commits with hash, age, message and tags. Add a number for more or fewer commits, and a type (`fix`, `feat`, … or `breaking`) to filter:
+It shows:
+
+- **Branch:** the current branch, its upstream, and how many commits you are ahead or behind. The numbers are as of the last `git fetch`. Without an upstream it says which remote `gcp` would push to.
+- **Release:** on a `release/X.Y` branch, which tag the next `fix` would create, e.g. `next fix creates v1.4.3`.
+- **Changes:** all changed and untracked files, like `git status --short`.
+- **Warnings:** everything that would make `gcp` stop:
+  - files that look like secrets (`.env`, `id_rsa`, `*.pem`, …)
+  - files of 100 MiB or more
+  - `main`/`master` without `ALLOW_MAIN=1`
+  - no remote, or several remotes and no upstream
+  - a rebase, merge or cherry-pick in progress
+  - detached `HEAD`
+  - a release branch without base tag, or with a wrong name
+  - gitleaks not installed
+
+If there is nothing to warn about, it ends with `✓ Ready for gcp`.
+
+### gcp history
+
+```sh
+gcp history [n] [type]
+```
+
+Lists the last commits, one per line with short hash, age, message and tags. It only reads, nothing is changed.
+
+| Command | Shows |
+| --- | --- |
+| `gcp history` | the last 10 commits |
+| `gcp history 30` | the last 30 commits |
+| `gcp history fix` | the last 10 `fix` commits |
+| `gcp history 5 feat` | the last 5 `feat` commits (order of the arguments does not matter) |
+| `gcp history breaking` | breaking changes (`!` or a `BREAKING CHANGE:` footer) |
+
+All types from the [table below](#commit-types-and-gitmoji) can be used as a filter. The scope does not matter: `gcp history fix` also finds `fix(api): …`.
 
 ```text
 $ gcp history 3 fix
@@ -119,6 +158,8 @@ $ gcp history 3 fix
 e44a390  5 days ago   fix: 🐛 correct timezone in export   v1.0.1
 c1d2e3f  2 weeks ago  fix: 🐛 typo in README
 ```
+
+Tags are shown at the end of the line, so on a release branch you can see at a glance which fix went into which version.
 
 ### Interactive selection
 
