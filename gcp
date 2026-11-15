@@ -4,6 +4,7 @@
 # Usage: gcp [-y|--yes] "<type>[(scope)][!]: [gitmoji] <description>" [--] [path...]
 #   -y, --yes          skip the confirmation prompt (also: GCP_YES=1)
 #   -i, --interactive  pick the files to commit from a list (fzf if installed)
+#        gcp status | gcp history [n] [type]
 #   path...            commit only these files/directories (default: all changes)
 #   e.g. gcp "fix(api): handle empty response"
 #        -> fix(api): 🐛 handle empty response
@@ -28,6 +29,9 @@ set -euo pipefail
 MAX_FILE_MIB=100
 MAX_HEADER_LENGTH=72
 CC_TYPES='feat|fix|build|chore|ci|docs|style|refactor|perf|test|revert'
+# File names that look like secrets (files ending in .example/.sample/.template/.dist are allowed)
+SECRET_PATTERN='(^|/)(\.env(\.[^/]+)?|id_rsa|id_ed25519|[^/]+\.pem|[^/]+\.key|[^/]+\.p12|[^/]+\.pfx|credentials(\.json)?)$'
+SECRET_ALLOWED='\.(example|sample|template|dist)$'
 
 # Type -> gitmoji (https://github.com/carloscuesta/gitmoji)
 declare -A GITMOJI=(
@@ -89,6 +93,8 @@ gcp - stage, commit and push in one step, with safety checks
 
 Usage:
   gcp [options] "<type>[(scope)][!]: <description>" [--] [path...]
+  gcp status                  show branch, changes and what gcp would block
+  gcp history [n] [type]      show the last n commits (default 10), optional type filter
 
   Without paths, all changes are committed. With paths, only those.
   The message must be quoted and comes before the paths.
@@ -112,6 +118,7 @@ Examples:
   gcp "fix(api): handle empty response"
   gcp "docs: update install notes" README.md docs/
   gcp -i "refactor: clean up helpers"
+  gcp history 20 fix
   ALLOW_MAIN=1 gcp "chore: bump version"
 
 On release/X.Y branches, a fix creates the next patch tag (vX.Y.Z).
@@ -121,7 +128,8 @@ EOF
 
 ASSUME_YES="${GCP_YES:-0}"
 INTERACTIVE=0
-USAGE="usage: $(basename "$0") [-y|--yes] [-i|--interactive] \"<type>[(scope)][!]: <description>\" [--] [path...] (quote the message)"
+USAGE="usage: $(basename "$0") [-y|--yes] [-i|--interactive] \"<type>[(scope)][!]: <description>\" [--] [path...] (quote the message)
+       $(basename "$0") status | history [n] [type] | -h"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -134,6 +142,186 @@ $USAGE" ;;
         *)                 break ;;
     esac
 done
+
+# ---------------------------------------------------------------------------
+# Subcommands: status, history (read-only)
+# ---------------------------------------------------------------------------
+
+if [[ -t 1 ]]; then
+    C_RESET=$'\e[0m'; C_DIM=$'\e[2m'; C_BOLD=$'\e[1m'
+    C_YELLOW=$'\e[33m'; C_GREEN=$'\e[32m'; C_RED=$'\e[31m'; C_CYAN=$'\e[36m'
+else
+    C_RESET=""; C_DIM=""; C_BOLD=""; C_YELLOW=""; C_GREEN=""; C_RED=""; C_CYAN=""
+fi
+
+require_repo() {
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not a git repository."
+}
+
+cmd_status() {
+    [[ $# -eq 0 ]] || die "usage: gcp status"
+    require_repo
+
+    local branch upstream remote counts ahead behind
+    local -a warnings=()
+    branch="$(git branch --show-current)"
+
+    # Branch and remote
+    if [[ -z "$branch" ]]; then
+        echo "Branch:  ${C_RED}detached HEAD${C_RESET}"
+        warnings+=("detached HEAD, check out a branch first")
+    elif upstream="$(git rev-parse --abbrev-ref --symbolic-full-name "@{u}" 2>/dev/null)"; then
+        counts="$(git rev-list --left-right --count "@{u}...HEAD" 2>/dev/null || echo "0 0")"
+        behind="${counts%%[[:space:]]*}"
+        ahead="${counts##*[[:space:]]}"
+        local sync="up to date"
+        if (( ahead || behind )); then
+            sync="${ahead} ahead, ${behind} behind"
+        fi
+        echo "Branch:  ${C_BOLD}${branch}${C_RESET} → ${upstream} (${sync}, as of last fetch)"
+    else
+        local -a remotes=()
+        mapfile -t remotes < <(git remote)
+        case ${#remotes[@]} in
+            0) remote=""; warnings+=("no remote configured, gcp cannot push") ;;
+            1) remote="${remotes[0]}" ;;
+            *) remote=""; warnings+=("multiple remotes and no upstream, push once: git push -u <remote> $branch") ;;
+        esac
+        if git rev-parse -q --verify HEAD >/dev/null; then
+            echo "Branch:  ${C_BOLD}${branch}${C_RESET} (no upstream${remote:+, gcp will push to $remote})"
+        else
+            echo "Branch:  ${C_BOLD}${branch}${C_RESET} (no commits yet${remote:+, gcp will push to $remote})"
+        fi
+    fi
+
+    # Branch rules
+    if [[ "$branch" == "main" || "$branch" == "master" ]] && [[ "${ALLOW_MAIN:-0}" != "1" ]]; then
+        warnings+=("on $branch: gcp needs ALLOW_MAIN=1")
+    fi
+    if [[ "$branch" == release/* ]]; then
+        if [[ "$branch" =~ ^release/([0-9]+)\.([0-9]+)$ ]]; then
+            local maj="${BASH_REMATCH[1]}" min="${BASH_REMATCH[2]}" last
+            last="$(git tag --list "v${maj}.${min}.*" | sed -E "s/^v${maj}\.${min}\.//" \
+                | grep -E '^[0-9]+$' | sort -n | tail -n1 || true)"
+            if [[ -n "$last" ]]; then
+                echo "Release: next fix creates v${maj}.${min}.$((last + 1)) (local tags); feat and breaking are blocked"
+            else
+                warnings+=("no base tag v${maj}.${min}.0 yet, a fix would be blocked")
+            fi
+        else
+            warnings+=("release branches must be named release/X.Y")
+        fi
+    fi
+
+    # Operation in progress
+    local gd
+    gd="$(git rev-parse --git-dir)"
+    if [[ -d "$gd/rebase-merge" || -d "$gd/rebase-apply" ]]; then
+        warnings+=("rebase in progress: git rebase --continue or --abort")
+    elif [[ -f "$gd/MERGE_HEAD" ]]; then
+        warnings+=("merge in progress: finish it or git merge --abort")
+    elif [[ -f "$gd/CHERRY_PICK_HEAD" ]]; then
+        warnings+=("cherry-pick in progress: git cherry-pick --continue or --abort")
+    fi
+
+    # Changes
+    echo
+    if [[ -z "$(git status --porcelain)" ]]; then
+        echo "Changes: ${C_GREEN}none, working tree clean${C_RESET}"
+    else
+        echo "Changes:"
+        local color=never
+        [[ -t 1 ]] && color=always
+        git -c color.status="$color" --no-pager status --short | sed 's/^/  /'
+
+        # Files gcp would block: secret-like names, too large files
+        local top file size max_bytes=$((MAX_FILE_MIB * 1024 * 1024))
+        top="$(git rev-parse --show-toplevel)"
+        while IFS= read -r -d '' file; do
+            [[ -f "$top/$file" ]] || continue
+            if [[ "$file" =~ $SECRET_PATTERN ]] && [[ ! "$file" =~ $SECRET_ALLOWED ]]; then
+                warnings+=("$file looks like a secret, add it to .gitignore")
+            fi
+            size="$(stat -c %s -- "$top/$file" 2>/dev/null || stat -f %z -- "$top/$file" 2>/dev/null || echo 0)"
+            if (( size >= max_bytes )); then
+                warnings+=("$file is $((size / 1024 / 1024)) MiB, use Git LFS or .gitignore")
+            fi
+        done < <(git -C "$top" ls-files -z --modified --others --exclude-standard)
+    fi
+
+    # Tools
+    if [[ "${SKIP_GITLEAKS:-0}" != "1" ]] && ! command -v gitleaks >/dev/null 2>&1; then
+        warnings+=("gitleaks is not installed, gcp will refuse to commit (or use SKIP_GITLEAKS=1)")
+    fi
+
+    echo
+    if (( ${#warnings[@]} )); then
+        echo "Warnings:"
+        local w
+        for w in "${warnings[@]}"; do
+            echo "  ${C_YELLOW}⚠${C_RESET} $w"
+        done
+    else
+        echo "${C_GREEN}✓ Ready for gcp${C_RESET}"
+    fi
+}
+
+cmd_history() {
+    local count=10 filter="" arg
+    for arg in "$@"; do
+        if [[ "$arg" =~ ^[1-9][0-9]*$ ]]; then
+            count="$arg"
+        elif [[ "$arg" =~ ^(${CC_TYPES}|breaking)$ ]]; then
+            filter="$arg"
+        else
+            die "usage: gcp history [n] [type]  (types: ${CC_TYPES//|/, }, breaking)"
+        fi
+    done
+    require_repo
+
+    if ! git rev-parse -q --verify HEAD >/dev/null; then
+        echo "No commits yet."
+        return 0
+    fi
+
+    local -a grep_args=()
+    if [[ "$filter" == "breaking" ]]; then
+        grep_args=(-E --grep='^[a-z]+(\([^)]*\))?!: ' --grep='^BREAKING[ -]CHANGE: ')
+    elif [[ -n "$filter" ]]; then
+        grep_args=(-E --grep="^${filter}(\\([^)]*\\))?!?: ")
+    fi
+
+    local hash date subject refs tags out
+    out="$(git --no-pager log -n "$count" ${grep_args[@]+"${grep_args[@]}"} \
+        --format='%h%x1f%cr%x1f%s%x1f%D%x1e')"
+    if [[ -z "$out" ]]; then
+        echo "No ${filter:+$filter }commits found."
+        return 0
+    fi
+
+    # Width of the date column
+    local width=0 d
+    while IFS= read -r d; do
+        (( ${#d} > width )) && width=${#d}
+    done < <(printf '%s' "$out" | tr '\036' '\n' | sed '/^$/d' | cut -d $'\037' -f2)
+
+    while IFS=$'\037' read -r -d $'\036' hash date subject refs; do
+        hash="${hash#$'\n'}"
+        tags=""
+        if [[ -n "$refs" ]]; then
+            # "HEAD -> main, tag: v1.0.1, origin/main" -> "v1.0.1"
+            tags="$(printf '%s' "$refs" | tr ',' '\n' | sed -n 's/^ *tag: //p' | paste -sd ' ' -)"
+        fi
+        printf '%s%s%s  %s%-*s%s  %s%s\n' \
+            "$C_YELLOW" "$hash" "$C_RESET" "$C_DIM" "$width" "$date" "$C_RESET" "$subject" \
+            "${tags:+  ${C_GREEN}${tags}${C_RESET}}"
+    done <<< "$out"
+}
+
+case "${1:-}" in
+    status)  shift; cmd_status "$@"; exit 0 ;;
+    history) shift; cmd_history "$@"; exit 0 ;;
+esac
 
 if [[ $# -lt 1 ]]; then
     die "$USAGE"
@@ -449,10 +637,9 @@ else
 fi
 
 # 1) Suspicious file names (only added/copied/modified/renamed, deletions are fine)
-SECRET_PATTERN='(^|/)(\.env(\.[^/]+)?|id_rsa|id_ed25519|[^/]+\.pem|[^/]+\.key|[^/]+\.p12|[^/]+\.pfx|credentials(\.json)?)$'
 SUSPICIOUS="$(git diff --cached --name-only --diff-filter=ACMR ${PATHSPEC[@]+"${PATHSPEC[@]}"} \
     | grep -E "$SECRET_PATTERN" \
-    | grep -Ev '\.(example|sample|template|dist)$' || true)"
+    | grep -Ev "$SECRET_ALLOWED" || true)"
 
 if [[ -n "$SUSPICIOUS" ]]; then
     echo "Error: files that look like secrets are staged:" >&2

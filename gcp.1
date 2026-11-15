@@ -13,6 +13,12 @@ gcp \- stage, commit and push all changes in one step, with safety checks
 .IR description \(dq
 .RB [ \-\- ]
 .RI [ path ...]
+.br
+.B gcp status
+.br
+.B gcp history
+.RI [ n ]
+.RI [ type ]
 .SH DESCRIPTION
 .B gcp
 stages all changes in the current repository (or only the given
@@ -40,6 +46,35 @@ exist or be tracked by git (a deleted tracked file is allowed).
 A
 .B \-\-
 before the paths is optional and allows paths starting with a dash.
+.SH SUBCOMMANDS
+Both subcommands only show information and change nothing.
+.TP
+.B status
+Shows the branch, its upstream and how many commits it is ahead or behind
+(as of the last fetch), the changed files, and warnings about everything
+.B gcp
+would block: files that look like secrets, files of 100 MiB or more,
+.B main
+without
+.BR ALLOW_MAIN ,
+a missing remote, a rebase or merge in progress, a missing gitleaks.
+On a
+.BI release/ X . Y
+branch it also shows which tag the next
+.B fix
+would create.
+.TP
+.B history \fR[\fIn\fR] [\fItype\fR]
+Shows the last
+.I n
+commits (default 10), one per line with hash, age, message and tags.
+With a
+.I type
+(for example
+.BR fix ),
+only commits of that type are shown;
+.B breaking
+shows breaking changes.
 .SH COMMIT MESSAGE
 The header must follow Conventional Commits 1.0.0:
 .PP
@@ -222,6 +257,15 @@ Success, nothing to commit, or aborted by the user.
 .B 1
 A check failed or a git command failed.
 .SH EXAMPLES
+Check before committing, look at the last fixes:
+.PP
+.RS
+.nf
+$ gcp status
+$ gcp history 20 fix
+.fi
+.RE
+.PP
 Pick the files interactively:
 .PP
 .RS

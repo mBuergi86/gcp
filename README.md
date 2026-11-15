@@ -23,6 +23,7 @@ Commit and push these changes? [y/N] y
 - **Secret protection:** files like `.env` or `id_rsa` are blocked by name, and [gitleaks](https://github.com/gitleaks/gitleaks) scans the staged content.
 - **Large file check:** files of 100 MiB or more are rejected, because GitHub would reject them.
 - **Safe on failure:** when a check fails after staging, all changes are unstaged again and nothing in the working tree is lost.
+- **Status and history:** `gcp status` warns before a commit would be blocked, `gcp history` lists commits, filterable by type.
 - **Single files or all changes:** commit everything, only the paths you name, or pick files interactively (`-i`, with fzf if installed).
 - **Rebase before push:** if the branch has an upstream, `gcp` runs `git pull --rebase --autostash` first, so other uncommitted changes are kept.
 - **Release tagging:** a `fix` on `release/X.Y` creates and pushes the next patch tag.
@@ -79,6 +80,13 @@ gcp [-y|--yes] [-i|--interactive] "<type>[(scope)][!]: [gitmoji] <description>" 
 
 The message must be passed as **one quoted argument**, before any paths. A body and footers go on further lines inside the same quotes.
 
+Two read-only subcommands help before and after committing:
+
+```sh
+gcp status               # branch, ahead/behind, changes, and what gcp would block
+gcp history [n] [type]   # last n commits (default 10), e.g. "gcp history 20 fix"
+```
+
 Without paths, `gcp` commits **all** changes. With paths, only those files and directories are staged, checked and committed. Everything else stays as it is, even if it is already staged.
 
 | Option / variable | Effect |
@@ -87,6 +95,30 @@ Without paths, `gcp` commits **all** changes. With paths, only those files and d
 | `-y`, `--yes`, `GCP_YES=1` | Skip the confirmation prompt (needed without an interactive terminal, e.g. in scripts, editors or AI agents). The summary is still printed. |
 | `ALLOW_MAIN=1` | Allow committing directly to `main` or `master`. |
 | `SKIP_GITLEAKS=1` | Skip the content secret scan. Not recommended. |
+
+### Status and history
+
+`gcp status` shows where you are and warns about everything `gcp` would block, before you try to commit:
+
+```text
+Branch:  feature/api → origin/feature/api (2 ahead, 0 behind, as of last fetch)
+
+Changes:
+   M src/api.js
+  ?? .env
+
+Warnings:
+  ⚠ .env looks like a secret, add it to .gitignore
+```
+
+`gcp history` lists the last commits with hash, age, message and tags. Add a number for more or fewer commits, and a type (`fix`, `feat`, … or `breaking`) to filter:
+
+```text
+$ gcp history 3 fix
+8af7e58  2 days ago   fix(api): 🐛 handle empty response  v1.0.2
+e44a390  5 days ago   fix: 🐛 correct timezone in export   v1.0.1
+c1d2e3f  2 weeks ago  fix: 🐛 typo in README
+```
 
 ### Interactive selection
 
