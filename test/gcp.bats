@@ -66,11 +66,12 @@ first_commit() {
     [[ "$output" == *"gcp undo"* ]]
 }
 
-@test "--version and -V print the version" {
+@test "--version, -v and -V print the version" {
     run gcp --version
     [ "$status" -eq 0 ]
     [[ "$output" =~ ^gcp\ [0-9]+\.[0-9]+\.[0-9]+$ ]]
     [ "$(gcp -V)" = "$output" ]
+    [ "$(gcp -v)" = "$output" ]
 }
 
 @test "unknown option is rejected" {

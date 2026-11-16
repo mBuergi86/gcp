@@ -58,7 +58,7 @@ _gcp() {
         if [[ $PREFIX == -* ]]; then
             _arguments -s $opts \
                 '(- *)'{-h,--help}'[show help]' \
-                '(- *)'{-V,--version}'[show version]'
+                '(- *)'{-v,-V,--version}'[show version]'
         else
             _describe -t commands 'gcp command' subcmds
             _gcp_types

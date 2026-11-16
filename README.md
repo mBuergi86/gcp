@@ -69,7 +69,7 @@ With the one-line install, pass options after `bash -s --`:
 curl -fsSL https://raw.githubusercontent.com/mBuergi86/gcp/main/install.sh | bash -s -- --zshrc --version 1.0.0
 ```
 
-`gcp --version` shows the installed version.
+`gcp --version` (or `-v`, `-V`) shows the installed version.
 
 ### oh-my-zsh users
 
@@ -95,7 +95,7 @@ autoload -Uz _gcp && (( $+functions[compdef] )) && compdef _gcp gcp
 
 ```sh
 gcp [-y|--yes] [-i|--interactive] "<type>[(scope)][!]: [gitmoji] <description>" [--] [path...]
-gcp -h | --help | -V | --version
+gcp -h | --help | -v | -V | --version
 ```
 
 The message must be passed as **one quoted argument**, before any paths. A body and footers go on further lines inside the same quotes.
