@@ -7,6 +7,11 @@
 #   gcp undo [-y]
 #   gcp status
 #   gcp history [n] [type]
+#   gcp new <type> <name>
+#   gcp sync [-y]
+#   gcp pr [-y] [--draft | --merge]
+#   gcp changelog [--all] [since]
+#   gcp release [-y] [-n] [major|minor|patch]
 #
 #   -y, --yes          skip the confirmation prompt (also: GCP_YES=1)
 #   -i, --interactive  pick the files to commit from a list (fzf if installed)
@@ -31,7 +36,7 @@
 #   GCP_NO_FZF=1      use the numbered list for -i even if fzf is installed
 set -euo pipefail
 
-GCP_VERSION="1.0.0"
+GCP_VERSION="1.1.0"
 MAX_FILE_MIB=100
 MAX_HEADER_LENGTH=72
 CC_TYPES='feat|fix|build|chore|ci|docs|style|refactor|perf|test|revert'
@@ -94,6 +99,17 @@ Usage:
   gcp status                  show branch, changes and what gcp would block
   gcp history [n] [type]      show the last n commits (default 10), optional type filter
 
+Branch workflow:
+  gcp new <type> <name>       new branch <type>/<name> from the latest main
+  gcp sync [-y]               rebase the branch onto the latest main
+  gcp pr [--draft|--merge]    push and open a pull request (needs gh);
+                              --merge also squash merges and returns to main
+  gcp changelog [--all] [since]
+                              features, fixes and breaking changes since the last tag
+  gcp release [-n] [major|minor|patch]
+                              tag the next version on main (from the commits)
+                              and create the GitHub release; -n: dry run
+
   Without paths, all changes are committed. With paths, only those.
   The message must be quoted and comes before the paths.
 
@@ -115,6 +131,10 @@ Types (gitmoji is added automatically):
   Breaking change: "feat!: ..." or a "BREAKING CHANGE: ..." footer.
 
 Examples:
+  gcp new feat login form      # -> branch feat/login-form
+  gcp "feat: add login form"
+  gcp pr --merge
+  gcp release
   gcp "fix(api): handle empty response"
   gcp "docs: update install notes" README.md docs/
   gcp -i "refactor: clean up helpers"
@@ -130,7 +150,8 @@ EOF
 
 USAGE="usage: gcp [-y] [-i] \"<type>[(scope)][!]: <description>\" [--] [path...] (quote the message)
        gcp amend [-y] [-i] [-m \"<message>\"] [--] [path...]
-       gcp undo [-y] | status | history [n] [type] | -h | -v"
+       gcp undo [-y] | status | history [n] [type] | -h | -v
+       gcp new <type> <name> | sync | pr [--draft|--merge] | changelog | release"
 
 # True if the word is a gitmoji shortcode (:bug:) or starts with a unicode emoji.
 # Checked on UTF-8 bytes: U+1Fxxx (F0 9F ..) and symbols U+2190-U+2BFF (E2 86..AF ..).
@@ -1025,6 +1046,490 @@ cmd_history() {
 }
 
 # ---------------------------------------------------------------------------
+# Branch workflow helpers
+# ---------------------------------------------------------------------------
+
+# Remote for commands that work without a branch context: origin, else the only one
+pick_remote() {
+    local -a remotes=()
+    mapfile -t remotes < <(git remote)
+    if [[ " ${remotes[*]} " == *" origin "* ]]; then
+        echo origin
+    elif (( ${#remotes[@]} == 1 )); then
+        echo "${remotes[0]}"
+    fi
+}
+
+# default_branch [remote]: <remote>/HEAD, else main, else master
+default_branch() {
+    local remote="${1:-}" ref
+    if [[ -n "$remote" ]] && ref="$(git symbolic-ref -q --short "refs/remotes/$remote/HEAD" 2>/dev/null)"; then
+        echo "${ref#"$remote"/}"
+        return
+    fi
+    for ref in main master; do
+        if git rev-parse -q --verify "refs/heads/$ref" >/dev/null \
+            || { [[ -n "$remote" ]] && git rev-parse -q --verify "refs/remotes/$remote/$ref" >/dev/null; }; then
+            echo "$ref"
+            return
+        fi
+    done
+    echo main
+}
+
+has_upstream() {
+    git rev-parse --abbrev-ref --symbolic-full-name "@{u}" >/dev/null 2>&1
+}
+
+# Explains a failed pull/rebase and exits
+rebase_failed() {
+    if [[ -n "$(operation_in_progress)" ]]; then
+        echo "Error: rebase stopped because of a conflict." >&2
+        echo "Your commits are safe. Resolve the conflicts, then run:" >&2
+        echo "  git add <files> && git rebase --continue" >&2
+        echo "Or go back to where you were with:" >&2
+        echo "  git rebase --abort" >&2
+    else
+        echo "Error: could not update from $REMOTE (network, access or missing branch?)." >&2
+    fi
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# gcp new <type> <name>
+# ---------------------------------------------------------------------------
+
+cmd_new() {
+    [[ $# -ge 2 ]] || die "usage: gcp new <type> <name>  (e.g. gcp new feat login form)"
+    local type="$1" name branch remote base start
+    shift
+    [[ "$type" =~ ^(${CC_TYPES})$ ]] || die "unknown type '$type'. Types: ${CC_TYPES//|/, }"
+
+    # "Login Form" -> login-form
+    name="$(printf '%s' "$*" | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/[^a-z0-9._-]+/-/g; s/-+/-/g; s/^[-.]+//; s/[-.]+$//')"
+    [[ -n "$name" ]] || die "branch name is empty (use letters, digits, '-', '_' or '.')."
+    branch="$type/$name"
+    git check-ref-format --branch "$branch" >/dev/null 2>&1 || die "invalid branch name: $branch"
+
+    require_repo
+    require_commits
+    require_no_operation
+    if git rev-parse -q --verify "refs/heads/$branch" >/dev/null; then
+        die "branch $branch already exists. Switch to it with: git switch $branch"
+    fi
+
+    remote="$(pick_remote)"
+    base="$(default_branch "$remote")"
+    start="$base"
+    if [[ -n "$remote" ]]; then
+        if git fetch --quiet "$remote" "$base" 2>/dev/null; then
+            start="$remote/$base"
+        else
+            echo "Warning: could not fetch $remote/$base, starting from the local $base." >&2
+        fi
+    fi
+    git rev-parse -q --verify "$start^{commit}" >/dev/null || die "base branch $start not found."
+
+    # --no-track: the new branch must not push to or pull from main
+    git switch --quiet --no-track -c "$branch" "$start" \
+        || die "could not create $branch. Commit or stash changes that conflict with $start first."
+
+    echo "Created ${C_BOLD}${branch}${C_RESET} from ${start} and switched to it."
+    echo "Next: make your changes, then: gcp \"$type: ...\" and gcp pr"
+}
+
+# ---------------------------------------------------------------------------
+# gcp sync [-y]
+# ---------------------------------------------------------------------------
+
+cmd_sync() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -y|--yes) ASSUME_YES=1; shift ;;
+            *)        die "usage: gcp sync [-y]" ;;
+        esac
+    done
+    require_repo
+    require_commits
+    require_no_operation
+    BRANCH="$(git branch --show-current)"
+    [[ -n "$BRANCH" ]] || die "detached HEAD, check out a branch first."
+    require_remote
+
+    local base pushed_only behind
+    base="$(default_branch "$REMOTE")"
+
+    if [[ "$BRANCH" == "$base" ]]; then
+        git pull --quiet --rebase --autostash "$REMOTE" "$base" || rebase_failed
+        echo "${C_GREEN}✓${C_RESET} $base is up to date with $REMOTE."
+        return 0
+    fi
+
+    git fetch --quiet "$REMOTE" "$base" || die "could not fetch $REMOTE/$base."
+    git rev-parse -q --verify "$REMOTE/$base" >/dev/null || die "$REMOTE/$base not found."
+
+    # First take over commits pushed to this branch from elsewhere
+    if has_upstream; then
+        git pull --quiet --rebase --autostash || rebase_failed
+    fi
+
+    behind="$(git rev-list --count "HEAD..$REMOTE/$base")"
+    if (( behind == 0 )); then
+        echo "${C_GREEN}✓${C_RESET} $BRANCH already has all commits from $base."
+        return 0
+    fi
+
+    # Pushed commits that the rebase will rewrite -> force push needed
+    pushed_only=0
+    if has_upstream; then
+        pushed_only="$(git rev-list --count "$REMOTE/$base..@{u}")"
+    fi
+
+    echo "Rebasing ${C_BOLD}${BRANCH}${C_RESET} onto $REMOTE/$base ($behind new commit(s) on $base)."
+    if (( pushed_only )); then
+        echo "$pushed_only commit(s) of $BRANCH are already pushed. They get new hashes,"
+        echo "so the branch is pushed with --force-with-lease afterwards."
+        require_tty_for_confirm
+        confirm "Continue?"
+    fi
+
+    git rebase --quiet --autostash "$REMOTE/$base" || rebase_failed
+
+    if has_upstream && ! git merge-base --is-ancestor "@{u}" HEAD; then
+        git push --quiet --force-with-lease \
+            || die "rebase done, but the push failed. Retry with: git push --force-with-lease"
+        echo "Pushed $BRANCH (--force-with-lease)."
+    fi
+    echo "${C_GREEN}✓${C_RESET} $BRANCH is up to date with $base."
+}
+
+# ---------------------------------------------------------------------------
+# gcp pr [-y] [--draft | --merge]
+# ---------------------------------------------------------------------------
+
+cmd_pr() {
+    local merge=0 draft=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -y|--yes)   ASSUME_YES=1; shift ;;
+            -d|--draft) draft=1; shift ;;
+            --merge)    merge=1; shift ;;
+            *)          die "usage: gcp pr [-y] [--draft | --merge]" ;;
+        esac
+    done
+    (( draft && merge )) && die "--draft and --merge cannot be combined."
+
+    require_repo
+    require_commits
+    require_no_operation
+    command -v gh >/dev/null 2>&1 || die "gcp pr needs the GitHub CLI (gh): https://cli.github.com"
+    BRANCH="$(git branch --show-current)"
+    [[ -n "$BRANCH" ]] || die "detached HEAD, check out a branch first."
+    require_remote
+
+    local base title body existing url line
+    base="$(default_branch "$REMOTE")"
+    if [[ "$BRANCH" == "$base" || "$BRANCH" == "main" || "$BRANCH" == "master" ]]; then
+        die "you are on $BRANCH. Create a branch first: gcp new <type> <name>"
+    fi
+
+    git fetch --quiet "$REMOTE" "$base" || die "could not fetch $REMOTE/$base."
+    local -a commits=()
+    mapfile -t commits < <(git log --reverse --no-merges --format='%h %s' "$REMOTE/$base..HEAD")
+    (( ${#commits[@]} )) || die "$BRANCH has no commits that are not on $base. Commit first: gcp \"<type>: ...\""
+
+    # Title: the only commit, otherwise built from the branch name (feat/login-form -> feat: ✨ login form)
+    if (( ${#commits[@]} == 1 )); then
+        title="${commits[0]#* }"
+    elif [[ "$BRANCH" =~ ^(${CC_TYPES})/(.+)$ ]]; then
+        local words="${BASH_REMATCH[2]//[-_\/]/ }"
+        parse_message "${BASH_REMATCH[1]}: $words"
+        title="$HEADER"
+    else
+        title="${commits[0]#* }"
+    fi
+
+    body="## Commits"$'\n'
+    for line in "${commits[@]}"; do
+        body+=$'\n'"- ${line#* } (${line%% *})"
+    done
+
+    existing="$(gh pr view "$BRANCH" --json url,state -q 'select(.state == "OPEN") | .url' 2>/dev/null || true)"
+
+    echo "Branch:  ${C_BOLD}${BRANCH}${C_RESET} → ${base}"
+    if [[ -n "$existing" ]]; then
+        echo "PR:      already open: $existing (only pushing)"
+    else
+        echo "Title:   ${C_BOLD}${title}${C_RESET}"
+        (( draft )) && echo "Draft:   yes"
+    fi
+    echo "Commits:"
+    for line in "${commits[@]}"; do
+        echo "  ${C_DIM}${line%% *}${C_RESET} ${line#* }"
+    done
+    (( merge )) && echo "Then:    squash merge, delete the branch, switch to $base"
+    echo
+
+    require_tty_for_confirm
+    if (( merge )); then
+        confirm "Push, create the pull request and merge it?"
+    else
+        confirm "Push and ${existing:+update}${existing:-create} the pull request?"
+    fi
+
+    push_branch
+
+    if [[ -n "$existing" ]]; then
+        url="$existing"
+    else
+        local -a create=(gh pr create --base "$base" --head "$BRANCH" --title "$title" --body "$body")
+        (( draft )) && create+=(--draft)
+        url="$("${create[@]}")" || die "pushed, but creating the pull request failed. Retry with: gcp pr"
+        url="$(tail -n1 <<< "$url")"
+    fi
+    echo "Pull request: $url"
+
+    if (( merge )); then
+        gh pr merge "$BRANCH" --squash --delete-branch \
+            || die "merging failed (checks, reviews or conflicts?). The PR stays open: $url"
+        # gh usually switches back already; make sure and update the base branch
+        if [[ "$(git branch --show-current)" != "$base" ]]; then
+            git switch --quiet "$base" || die "merged, but could not switch to $base."
+        fi
+        git pull --quiet --ff-only "$REMOTE" "$base" \
+            || echo "Warning: merged, but could not update the local $base. Run: gcp sync" >&2
+        git branch -D "$BRANCH" >/dev/null 2>&1 || true
+        echo "${C_GREEN}✓${C_RESET} Merged and back on $base."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Changelog: gcp changelog, used by gcp release
+# ---------------------------------------------------------------------------
+
+# Last release tag vX.Y.Z reachable from HEAD, or nothing
+last_release_tag() {
+    git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' HEAD 2>/dev/null || true
+}
+
+# build_changelog <rev-range> <all: 0|1>
+# Sets CHANGELOG (markdown sections), CL_COMMITS, CL_BREAKING, CL_FEAT.
+build_changelog() {
+    local range="$1" all="$2"
+    local -a breaking=() feat=() fix=() perf=() other=()
+    local hash subject body type scope bang desc first entry
+    local breaking_re=$'(^|\n)BREAKING[ -]CHANGE: '
+    CL_COMMITS=0
+
+    while IFS=$'\x1f' read -r -d $'\x1e' hash subject body; do
+        hash="${hash#$'\n'}"
+        (( CL_COMMITS++ )) || true
+        if [[ ! "$subject" =~ ^(${CC_TYPES})(\(([a-z0-9._/-]+)\))?(!)?:\ (.+)$ ]]; then
+            (( all )) && other+=("- $subject ($hash)")
+            continue
+        fi
+        type="${BASH_REMATCH[1]}" scope="${BASH_REMATCH[3]}" bang="${BASH_REMATCH[4]}" desc="${BASH_REMATCH[5]}"
+        first="${desc%% *}"
+        if is_emoji "$first" && [[ "$desc" == *" "* ]]; then
+            desc="${desc#* }"
+        fi
+        entry="- ${scope:+**$scope:** }$desc ($hash)"
+
+        if [[ -n "$bang" || "$body" =~ $breaking_re ]]; then
+            breaking+=("$entry")
+        else
+            case "$type" in
+                feat) feat+=("$entry") ;;
+                fix)  fix+=("$entry") ;;
+                perf) perf+=("$entry") ;;
+                *)    (( all )) && other+=("$entry") ;;
+            esac
+        fi
+    done < <(git log --no-merges --format='%h%x1f%s%x1f%b%x1e' "$range")
+
+    CL_BREAKING=${#breaking[@]}
+    CL_FEAT=${#feat[@]}
+    CHANGELOG=""
+    _cl_section "${GITMOJI_BREAKING} Breaking Changes" ${breaking[@]+"${breaking[@]}"}
+    _cl_section "${GITMOJI[feat]} Features" ${feat[@]+"${feat[@]}"}
+    _cl_section "${GITMOJI[fix]} Bug Fixes" ${fix[@]+"${fix[@]}"}
+    _cl_section "${GITMOJI[perf]} Performance" ${perf[@]+"${perf[@]}"}
+    _cl_section "${GITMOJI[chore]} Other Changes" ${other[@]+"${other[@]}"}
+    CHANGELOG="${CHANGELOG%$'\n'}"
+}
+
+_cl_section() {
+    local title="$1"
+    shift
+    (( $# )) || return 0
+    CHANGELOG+="### $title"$'\n\n'
+    printf -v title '%s\n' "$@"
+    CHANGELOG+="$title"$'\n'
+}
+
+cmd_changelog() {
+    local all=0 from=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -a|--all) all=1; shift ;;
+            -*)       die "usage: gcp changelog [--all] [since]" ;;
+            *)        [[ -z "$from" ]] || die "usage: gcp changelog [--all] [since]"
+                      from="$1"; shift ;;
+        esac
+    done
+    require_repo
+    require_commits
+
+    local range heading
+    if [[ -z "$from" ]]; then
+        from="$(last_release_tag)"
+    else
+        git rev-parse -q --verify "$from^{commit}" >/dev/null || die "unknown tag or commit: $from"
+    fi
+    if [[ -n "$from" ]]; then
+        range="$from..HEAD"
+        heading="## Unreleased (since $from)"
+    else
+        range="HEAD"
+        heading="## Unreleased"
+    fi
+
+    build_changelog "$range" "$all"
+    if [[ -z "$CHANGELOG" ]]; then
+        if (( CL_COMMITS )); then
+            echo "No features, fixes or breaking changes since ${from:-the first commit} (${CL_COMMITS} other commit(s), see --all)."
+        else
+            echo "No commits since ${from:-the first commit}."
+        fi
+        return 0
+    fi
+    printf '%s\n\n%s\n' "$heading" "$CHANGELOG"
+}
+
+# ---------------------------------------------------------------------------
+# gcp release [-y] [-n] [major|minor|patch]
+# ---------------------------------------------------------------------------
+
+cmd_release() {
+    local bump="" dry=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -y|--yes)               ASSUME_YES=1; shift ;;
+            -n|--dry-run)           dry=1; shift ;;
+            major|minor|patch)      bump="$1"; shift ;;
+            *)                      die "usage: gcp release [-y] [-n|--dry-run] [major|minor|patch]" ;;
+        esac
+    done
+    require_repo
+    require_commits
+    require_no_operation
+    BRANCH="$(git branch --show-current)"
+    [[ -n "$BRANCH" ]] || die "detached HEAD, check out a branch first."
+    require_remote
+
+    local base last major=0 minor=0 patch=0 range reason new
+    base="$(default_branch "$REMOTE")"
+    if [[ "$BRANCH" != "$base" ]]; then
+        if [[ "$BRANCH" == release/* ]]; then
+            die "on release branches, gcp tags every fix automatically. gcp release runs on $base."
+        fi
+        die "releases are made from $base (you are on $BRANCH). Run: git switch $base"
+    fi
+    [[ -z "$(git status --porcelain --untracked-files=no)" ]] \
+        || die "there are uncommitted changes. Commit or stash them first."
+
+    git fetch --quiet --tags "$REMOTE" || die "could not fetch from $REMOTE."
+    has_upstream || die "$BRANCH has no upstream. Push it first."
+    local counts behind ahead
+    counts="$(git rev-list --left-right --count "@{u}...HEAD")"
+    behind="${counts%%[[:space:]]*}"
+    ahead="${counts##*[[:space:]]}"
+    (( behind == 0 )) || die "$BRANCH is $behind commit(s) behind $REMOTE. Run: gcp sync"
+    (( ahead == 0 ))  || die "$BRANCH has $ahead unpushed commit(s). Push them first, the release must be on $REMOTE."
+
+    last="$(last_release_tag)"
+    if [[ -n "$last" ]]; then
+        [[ "$last" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || die "last tag $last is not vX.Y.Z."
+        major="${BASH_REMATCH[1]}" minor="${BASH_REMATCH[2]}" patch="${BASH_REMATCH[3]}"
+        range="$last..HEAD"
+    else
+        range="HEAD"
+    fi
+
+    build_changelog "$range" 0
+    (( CL_COMMITS )) || die "nothing to release, no commits since $last."
+
+    if [[ -z "$bump" ]]; then
+        if (( CL_BREAKING )); then
+            bump='major'; reason="breaking changes"
+            if (( major == 0 )); then
+                bump='minor'; reason="breaking changes, but still 0.x"
+            fi
+        elif (( CL_FEAT )); then
+            bump='minor'; reason="new features"
+        else
+            bump='patch'; reason="fixes and other changes"
+        fi
+    else
+        reason="chosen by hand"
+    fi
+    if [[ -z "$last" ]]; then
+        new="v0.1.0"
+        [[ "$bump" == major ]] && new="v1.0.0"
+        reason="first release"
+    else
+        case "$bump" in
+            major) new="v$((major + 1)).0.0" ;;
+            minor) new="v${major}.$((minor + 1)).0" ;;
+            patch) new="v${major}.${minor}.$((patch + 1))" ;;
+        esac
+    fi
+    if git rev-parse -q --verify "refs/tags/$new" >/dev/null; then
+        die "tag $new already exists."
+    fi
+
+    local notes="$CHANGELOG"
+    [[ -n "$notes" ]] || notes="Maintenance release ($CL_COMMITS commit(s), no features or fixes)."
+
+    echo "Release: ${last:-(none)} → ${C_BOLD}${new}${C_RESET} ($bump: $reason)"
+    echo
+    echo "$notes"
+    echo
+
+    if (( dry )); then
+        echo "Dry run, nothing was tagged."
+        return 0
+    fi
+
+    local gh_release=0
+    if command -v gh >/dev/null 2>&1 && [[ "$(git remote get-url "$REMOTE")" == *github.com* ]]; then
+        gh_release=1
+    fi
+
+    require_tty_for_confirm
+    if (( gh_release )); then
+        confirm "Tag $new, push it and create the GitHub release?"
+    else
+        confirm "Tag $new and push it?"
+    fi
+
+    git tag -a "$new" -m "$new"
+    if ! git push --quiet "$REMOTE" "refs/tags/$new"; then
+        echo "Error: pushing tag $new failed. Retry with: git push $REMOTE refs/tags/$new" >&2
+        exit 1
+    fi
+    echo "Pushed tag $new."
+
+    if (( gh_release )); then
+        gh release create "$new" --verify-tag --title "$new" --notes "$notes" \
+            || die "tag pushed, but creating the GitHub release failed. Retry with: gh release create $new --generate-notes"
+    else
+        echo "No GitHub release created (needs gh and a GitHub remote)."
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1049,5 +1554,10 @@ case "$1" in
     history) shift; cmd_history "$@" ;;
     undo)    shift; cmd_undo "$@" ;;
     amend)   shift; cmd_amend "$@" ;;
+    new)     shift; cmd_new "$@" ;;
+    sync)    shift; cmd_sync "$@" ;;
+    pr)      shift; cmd_pr "$@" ;;
+    changelog) shift; cmd_changelog "$@" ;;
+    release) shift; cmd_release "$@" ;;
     *)       cmd_commit "$@" ;;
 esac

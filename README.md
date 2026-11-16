@@ -30,6 +30,8 @@ Commit and push these changes? [y/N] y
 - **Single files or all changes:** commit everything, only the paths you name, or pick files interactively (`-i`, with fzf if installed).
 - **Rebase before push:** if the branch has an upstream, `gcp` runs `git pull --rebase --autostash` first, so other uncommitted changes are kept.
 - **Release tagging:** a `fix` on `release/X.Y` creates and pushes the next patch tag.
+- **Branch workflow:** `gcp new` creates a branch from the latest `main`, `gcp sync` keeps it up to date, `gcp pr` opens the pull request (and merges it with `--merge`).
+- **Changelog and releases:** `gcp changelog` groups the commits since the last tag, `gcp release` picks the next version from them and publishes the GitHub release.
 - **Tab completion for zsh:** subcommands, commit types (with the opening quote) and changed files.
 
 ## Requirements
@@ -37,6 +39,7 @@ Commit and push these changes? [y/N] y
 - bash >= 4
 - git >= 2.22
 - [gitleaks](https://github.com/gitleaks/gitleaks) >= 8.19 (or run with `SKIP_GITLEAKS=1`)
+- optional: [gh](https://cli.github.com) for `gcp pr` and the GitHub release of `gcp release`, [fzf](https://github.com/junegunn/fzf) for `-i`
 
 ## Installation
 
@@ -107,6 +110,16 @@ gcp amend [-m "<message>"] [path...]  # add changes to the last commit (if not p
 gcp undo                              # undo the last commit, safely
 gcp status                            # branch, ahead/behind, changes, and what gcp would block
 gcp history [n] [type]                # last n commits (default 10), e.g. "gcp history 20 fix"
+```
+
+Subcommands for the branch workflow (see [below](#branch-workflow)):
+
+```sh
+gcp new <type> <name>                 # new branch <type>/<name> from the latest main
+gcp sync                              # rebase the branch onto the latest main
+gcp pr [--draft | --merge]            # push and open a pull request
+gcp changelog [--all] [since]         # changes since the last tag, as Markdown
+gcp release [-n] [major|minor|patch]  # tag the next version and publish the release
 ```
 
 Without paths, `gcp` commits **all** changes. With paths, only those files and directories are staged, checked and committed. Everything else stays as it is, even if it is already staged.
@@ -299,6 +312,66 @@ Direct commit to `main` without a prompt:
 ALLOW_MAIN=1 gcp -y "docs: update README"
 ```
 
+## Branch workflow
+
+`gcp` refuses to commit to `main`, so work happens on branches. These subcommands take you from a new branch to a release:
+
+```console
+$ gcp new feat login form
+Created feat/login-form from origin/main and switched to it.
+
+$ gcp "feat: add login form"          # first push creates the branch on the remote
+$ gcp "test: cover the login form"
+
+$ gcp pr --merge
+Branch:  feat/login-form → main
+Title:   feat: ✨ login form
+...
+Pull request: https://github.com/you/project/pull/12
+✓ Merged and back on main.
+
+$ gcp release
+Release: v1.0.0 → v1.1.0 (minor: new features)
+```
+
+### gcp new
+
+`gcp new <type> <name>` fetches `main` and creates `<type>/<name>` from the remote state, so the branch never starts on an old `main`. The name is lowercased and spaces become dashes (`gcp new fix Crash on Start` → `fix/crash-on-start`). The type must be a commit type, which keeps branch names consistent. The branch has no upstream yet; the first `gcp` commit pushes it.
+
+### gcp sync
+
+`gcp sync` brings the current branch up to date with `main` by rebasing onto it. If commits of the branch are already pushed, they get new hashes, so `gcp` asks first and then pushes with `--force-with-lease` (which refuses if someone else pushed to the branch in the meantime). On a conflict the rebase stops and `gcp` shows how to continue (`git rebase --continue`) or go back (`git rebase --abort`). On `main` itself, `gcp sync` just pulls.
+
+### gcp pr
+
+`gcp pr` pushes the branch and creates a pull request against `main` with the [GitHub CLI](https://cli.github.com) (`gh auth login` once). With one commit, its message is the title. With several, the title comes from the branch name (`feat/login-form` → `feat: ✨ login form`), so the squash-merged commit on `main` is again a Conventional Commit. The description lists all commits. If a pull request is already open, the branch is only pushed.
+
+| Option | Effect |
+| --- | --- |
+| `--draft` | Create a draft pull request |
+| `--merge` | Squash merge right away, delete the branch, switch to `main` and pull. Use it when no review is needed. |
+
+### gcp changelog
+
+`gcp changelog` prints the commits since the last `vX.Y.Z` tag as Markdown, grouped into 💥 breaking changes, ✨ features, 🐛 bug fixes and ⚡️ performance. Other types like `docs` or `refactor` are left out; `--all` adds them. Give a tag or commit to start from another point: `gcp changelog v1.0.0`. To keep it in a file: `gcp changelog > CHANGES.md`.
+
+### gcp release
+
+`gcp release` runs on `main`, which must be clean, pushed and up to date. It reads the commits since the last tag and picks the next version by [Semantic Versioning](https://semver.org):
+
+| Commits since the last tag | Next version |
+| --- | --- |
+| a breaking change | major, `v1.4.2` → `v2.0.0` (while `0.x`: minor) |
+| a `feat` | minor, `v1.4.2` → `v1.5.0` |
+| only `fix` and others | patch, `v1.4.2` → `v1.4.3` |
+| no tag yet | `v0.1.0` |
+
+It shows the version and the changelog, asks, then creates and pushes the tag. With `gh` and a GitHub remote it also creates the GitHub release with the changelog as notes. `gcp release minor` (or `major`, `patch`) overrides the version, `gcp release -n` only shows what would happen.
+
+`gcp release` does not edit files. If your project keeps its version in a file (like `GCP_VERSION` in `gcp`), commit that change first.
+
+This is separate from the automatic patch tags on `release/X.Y` branches described below.
+
 ## Safety checks
 
 `gcp` refuses to run, or stops before committing, when:
@@ -354,11 +427,10 @@ bats test/
 
 GitHub Actions runs both on every push and pull request.
 
-To make a release, raise `GCP_VERSION` in `gcp`, commit, then tag and publish it:
+To make a release, raise `GCP_VERSION` in `gcp`, get it onto `main`, then:
 
 ```sh
-git tag -a v1.1.0 -m "gcp 1.1.0" && git push origin v1.1.0
-gh release create v1.1.0 --generate-notes
+gcp release
 ```
 
 ## Exit status

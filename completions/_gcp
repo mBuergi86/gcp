@@ -41,6 +41,11 @@ _gcp() {
         'history:show the last commits'
         'undo:undo the last commit'
         'amend:add changes to the last commit'
+        'new:create a branch <type>/<name> from the latest main'
+        'sync:rebase the branch onto the latest main'
+        'pr:push and open a pull request'
+        'changelog:features, fixes and breaking changes since the last tag'
+        'release:tag the next version and create the GitHub release'
     )
     opts=(
         '(-i --interactive)'{-i,--interactive}'[pick the files from a list]'
@@ -66,7 +71,11 @@ _gcp() {
         return
     fi
 
-    case ${words[i]} in
+    # Let _arguments see the subcommand as the command name
+    words=(${words[i,-1]})
+    (( CURRENT -= i - 1 ))
+
+    case ${words[1]} in
         status)
             ;;
         history)
@@ -74,8 +83,36 @@ _gcp() {
             htypes=(feat fix docs style refactor perf test build ci chore revert breaking)
             _alternative 'count:number of commits:(5 10 20 50)' "types:type:($htypes)"
             ;;
-        undo)
+        undo|sync)
             _arguments '(-y --yes)'{-y,--yes}'[skip the confirmation prompt]'
+            ;;
+        new)
+            if (( CURRENT == 2 )); then
+                local -a btypes
+                btypes=(feat fix docs style refactor perf test build ci chore revert)
+                _describe -t types 'branch type' btypes
+            else
+                _message 'branch name'
+            fi
+            ;;
+        pr)
+            _arguments \
+                '(-y --yes)'{-y,--yes}'[skip the confirmation prompt]' \
+                '(-d --draft --merge)'{-d,--draft}'[create a draft pull request]' \
+                '(-d --draft)--merge[squash merge right away and return to main]'
+            ;;
+        changelog)
+            local -a tags
+            tags=(${(f)"$(git tag --list 'v*' --sort=-v:refname 2>/dev/null)"})
+            _arguments \
+                '(-a --all)'{-a,--all}'[include all commit types]' \
+                "1:since:(${tags[*]})"
+            ;;
+        release)
+            _arguments \
+                '(-y --yes)'{-y,--yes}'[skip the confirmation prompt]' \
+                '(-n --dry-run)'{-n,--dry-run}'[show the next version, tag nothing]' \
+                '1:bump:(major minor patch)'
             ;;
         amend)
             if [[ ${words[CURRENT-1]} == -m ]]; then

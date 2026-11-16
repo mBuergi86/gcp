@@ -593,3 +593,238 @@ local_commit() {
     command -v zsh >/dev/null || skip "zsh not installed"
     zsh -n "$BATS_TEST_DIRNAME/../completions/_gcp"
 }
+
+# ---------------------------------------------------------------------------
+# new, sync, pr, changelog, release
+# ---------------------------------------------------------------------------
+
+# A main branch with one commit on the remote; we stay on main
+main_setup() {
+    git symbolic-ref HEAD refs/heads/main
+    echo base > base.txt
+    git add base.txt
+    git commit -q -m "chore: initial commit"
+    git push -q -u origin main
+}
+
+# Commit on main through a second clone, as if someone else pushed
+remote_main_commit() {
+    git clone -q "$TMP/remote.git" "$TMP/other"
+    (
+        cd "$TMP/other"
+        echo "$1" > "$1.txt"
+        git add "$1.txt"
+        git commit -q -m "docs: $1"
+        git push -q origin main
+    )
+    rm -rf "$TMP/other"
+}
+
+# Fake gh: logs every call, "pr create" prints a URL
+fake_gh() {
+    mkdir -p "$TMP/bin"
+    cat > "$TMP/bin/gh" <<'GH'
+#!/usr/bin/env bash
+echo "$*" >> "$GH_LOG"
+case "$1 $2" in
+    "pr view")   [[ -n "${GH_EXISTING:-}" ]] && echo "$GH_EXISTING"; exit 0 ;;
+    "pr create") echo "https://github.com/x/y/pull/7" ;;
+esac
+exit 0
+GH
+    chmod +x "$TMP/bin/gh"
+    export PATH="$TMP/bin:$PATH" GH_LOG="$TMP/gh.log"
+}
+
+@test "new: creates type/name from the remote main, without upstream" {
+    main_setup
+    remote_main_commit later
+    run gcp new feat "Login Form"
+    [ "$status" -eq 0 ]
+    [ "$(git branch --show-current)" = "feat/login-form" ]
+    [ -f later.txt ]
+    [ -z "$(git config --get branch.feat/login-form.merge || true)" ]
+}
+
+@test "new: rejects an unknown type and an existing branch" {
+    main_setup
+    run gcp new feature login
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"unknown type"* ]]
+    gcp new fix crash >/dev/null
+    git switch -q main
+    run gcp new fix crash
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"already exists"* ]]
+}
+
+@test "new: first gcp commit pushes the new branch, not main" {
+    main_setup
+    gcp new feat login >/dev/null
+    echo x > x.txt
+    gcp -y "feat: add login" >/dev/null
+    [ "$(remote_subject feat/login)" = "feat: ✨ add login" ]
+    [ "$(remote_subject main)" = "chore: initial commit" ]
+}
+
+@test "sync: rebases the branch onto new commits from main" {
+    main_setup
+    gcp new feat login >/dev/null
+    echo x > x.txt
+    gcp -y "feat: add login" >/dev/null
+    remote_main_commit later
+    run gcp sync -y
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"force-with-lease"* ]]
+    [ -f later.txt ]
+    [ "$(subject)" = "feat: ✨ add login" ]
+    [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/feat/login)" ]
+}
+
+@test "sync: nothing to do" {
+    main_setup
+    gcp new feat login >/dev/null
+    run gcp sync
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"already has all commits"* ]]
+}
+
+@test "sync: conflict explains how to continue or abort" {
+    main_setup
+    gcp new fix base >/dev/null
+    echo mine > base.txt
+    git commit -q -am "fix: mine"
+    git clone -q "$TMP/remote.git" "$TMP/other"
+    (cd "$TMP/other" && echo theirs > base.txt && git commit -q -am "fix: theirs" && git push -q origin main)
+    run gcp sync
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"git rebase --abort"* ]]
+    git rebase --abort
+}
+
+@test "pr: refuses on main" {
+    main_setup
+    fake_gh
+    run gcp pr -y
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"gcp new"* ]]
+}
+
+@test "pr: refuses without commits on the branch" {
+    main_setup
+    fake_gh
+    gcp new feat login >/dev/null
+    run gcp pr -y
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"no commits"* ]]
+}
+
+@test "pr: pushes and creates the PR, title from the only commit" {
+    main_setup
+    fake_gh
+    gcp new feat login >/dev/null
+    echo x > x.txt
+    git add x.txt && git commit -q -m "feat: ✨ add login"
+    run gcp pr -y
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"pull/7"* ]]
+    [ "$(remote_subject feat/login)" = "feat: ✨ add login" ]
+    grep -q -- "pr create --base main --head feat/login --title feat: ✨ add login" "$GH_LOG"
+}
+
+@test "pr: title from the branch name with several commits, --draft" {
+    main_setup
+    fake_gh
+    gcp new feat login-form >/dev/null
+    echo x > x.txt; git add x.txt; git commit -q -m "feat: ✨ add form"
+    echo y > y.txt; git add y.txt; git commit -q -m "test: ✅ form tests"
+    run gcp pr -y --draft
+    [ "$status" -eq 0 ]
+    grep -q -- "--title feat: ✨ login form" "$GH_LOG"
+    grep -q -- "--draft" "$GH_LOG"
+}
+
+@test "pr: existing PR is only pushed" {
+    main_setup
+    fake_gh
+    export GH_EXISTING="https://github.com/x/y/pull/3"
+    gcp new fix crash >/dev/null
+    echo x > x.txt; git add x.txt; git commit -q -m "fix: 🐛 crash"
+    run gcp pr -y
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"pull/3"* ]]
+    ! grep -q "pr create" "$GH_LOG"
+}
+
+@test "pr --merge: squash merges and goes back to main" {
+    main_setup
+    fake_gh
+    gcp new fix crash >/dev/null
+    echo x > x.txt; git add x.txt; git commit -q -m "fix: 🐛 crash"
+    run gcp pr -y --merge
+    [ "$status" -eq 0 ]
+    grep -q -- "pr merge fix/crash --squash --delete-branch" "$GH_LOG"
+    [ "$(git branch --show-current)" = "main" ]
+    ! git rev-parse -q --verify refs/heads/fix/crash
+}
+
+@test "changelog: groups features, fixes and breaking changes since the last tag" {
+    main_setup
+    git tag -a v1.0.0 -m v1.0.0
+    git commit -q --allow-empty -m "feat(ui): ✨ dark mode"
+    git commit -q --allow-empty -m "fix: 🐛 crash on start"
+    git commit -q --allow-empty -m "docs: 📝 readme"
+    git commit -q --allow-empty -m "refactor!: 💥 new config format"
+    run gcp changelog
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"since v1.0.0"* ]]
+    [[ "$output" == *"### 💥 Breaking Changes"*"new config format"* ]]
+    [[ "$output" == *"### ✨ Features"*"**ui:** dark mode"* ]]
+    [[ "$output" == *"### 🐛 Bug Fixes"*"crash on start"* ]]
+    [[ "$output" != *"readme"* ]]
+    run gcp changelog --all
+    [[ "$output" == *"Other Changes"*"readme"* ]]
+}
+
+@test "release: feat bumps minor, tags and pushes" {
+    main_setup
+    git tag -a v1.0.0 -m v1.0.0 && git push -q origin v1.0.0
+    git commit -q --allow-empty -m "feat: ✨ dark mode"
+    git push -q
+    run gcp release -y
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"v1.0.0 → v1.1.0"* ]]
+    git --git-dir="$TMP/remote.git" rev-parse -q --verify refs/tags/v1.1.0
+}
+
+@test "release: fix bumps patch, breaking bumps major, dry run tags nothing" {
+    main_setup
+    git tag -a v1.2.3 -m v && git push -q origin v1.2.3
+    git commit -q --allow-empty -m "fix: 🐛 crash"
+    git push -q
+    run gcp release -n
+    [[ "$output" == *"→ v1.2.4"* ]]
+    git commit -q --allow-empty -m "feat!: 💥 new api"
+    git push -q
+    run gcp release -n
+    [[ "$output" == *"→ v2.0.0"* ]]
+    run gcp release -n minor
+    [[ "$output" == *"→ v1.3.0"* ]]
+    [ -z "$(git tag -l 'v1.2.4' 'v2.0.0' 'v1.3.0')" ]
+}
+
+@test "release: refuses on a branch, with unpushed commits and without changes" {
+    main_setup
+    git tag -a v1.0.0 -m v && git push -q origin v1.0.0
+    run gcp release -y
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"nothing to release"* ]]
+    git commit -q --allow-empty -m "fix: 🐛 crash"
+    run gcp release -y
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"unpushed"* ]]
+    git switch -q -c feat/x
+    run gcp release -y
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"made from main"* ]]
+}
