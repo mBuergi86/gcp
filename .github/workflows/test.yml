@@ -19,14 +19,19 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GITLEAKS_VERSION: 8.30.1
+      # sha256 of gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz (from the release's checksums.txt)
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
     steps:
       - uses: actions/checkout@v4
       - name: Install bats
-        run: sudo apt-get update -q && sudo apt-get install -y -q bats
-      - name: Install gitleaks
+        run: sudo apt-get update -q && sudo apt-get install -y -q bats zsh
+      - name: Install gitleaks (checksum verified)
         run: |
-          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin gitleaks
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$tarball"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          sudo tar -xzf "$RUNNER_TEMP/$tarball" -C /usr/local/bin gitleaks
           gitleaks version
       - name: Run tests
         run: bats test/
