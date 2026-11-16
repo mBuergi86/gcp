@@ -19,7 +19,7 @@ setup() {
 
     # gitleaks is tested separately; the numbered list instead of fzf for -i
     export SKIP_GITLEAKS=1 GCP_NO_FZF=1
-    unset ALLOW_MAIN GCP_YES
+    unset ALLOW_MAIN GCP_YES XDG_CONFIG_HOME GCP_SCOPES GCP_REQUIRE_SCOPE GCP_MAX_HEADER_LENGTH GCP_BASE_BRANCH
 
     git init -q --bare "$TMP/remote.git"
     git init -q "$TMP/work"
@@ -829,4 +829,98 @@ GH
     run gcp release -y
     [ "$status" -eq 1 ]
     [[ "$output" == *"made from main"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# .gcprc and gcp config
+# ---------------------------------------------------------------------------
+
+@test "gcprc: allowed scopes, with a hint for a typo" {
+    printf '# rules\nscopes = api, ui ,docs\n' > .gcprc
+    echo x > x.txt
+    run gcp -y "fix(aip): crash"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"scope 'aip' is not allowed"* ]]
+    [[ "$output" == *"Did you mean 'api'?"* ]]
+    run gcp -y "fix(api): crash"
+    [ "$status" -eq 0 ]
+    run gcp -y "docs: no scope is fine without require_scope" .gcprc
+    [ "$status" -eq 0 ]
+}
+
+@test "gcprc: require_scope, but gcp undo's revert still works" {
+    first_commit
+    echo 'require_scope = true' > .gcprc
+    echo x > x.txt
+    run gcp -y "fix: crash"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"scope is required"* ]]
+    gcp -y "chore(repo): add rules" >/dev/null
+    run gcp undo -y
+    [ "$status" -eq 0 ]
+    [[ "$(subject)" == "revert: ⏪️ chore(repo): 🔧 add rules" ]]
+}
+
+@test "gcprc: max_header_length" {
+    echo 'max_header_length = 30' > .gcprc
+    echo x > x.txt
+    run gcp -y "feat: this header is longer than thirty"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"max is 30"* ]]
+}
+
+@test "gcprc: base_branch is protected and used by gcp new" {
+    git symbolic-ref HEAD refs/heads/develop
+    echo base > base.txt
+    git add base.txt && git commit -q -m "chore: init"
+    git push -q -u origin develop
+    echo 'base_branch = develop' > .gcprc
+    echo x > x.txt
+    run gcp -y "chore: on develop"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"refusing to commit directly to develop"* ]]
+    rm x.txt
+    run gcp new feat thing
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"from origin/develop"* ]]
+}
+
+@test "gcprc: safety switches cannot be set, unknown keys and bad lines fail" {
+    echo 'skip_gitleaks = 1' > .gcprc
+    run gcp status
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"cannot be set in a config file"* ]]
+    echo 'scope = api' > .gcprc
+    run gcp status
+    [[ "$output" == *"unknown setting 'scope'"* ]]
+    echo 'echo hacked' > .gcprc
+    run gcp status
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"expected 'name = value'"* ]]
+}
+
+@test "gcprc: \$(...) in a value is never executed" {
+    echo 'scopes = "$(touch pwned)"' > .gcprc
+    run gcp status
+    [ "$status" -eq 1 ]
+    [ ! -e pwned ]
+}
+
+@test "config: precedence global < .gcprc < environment" {
+    mkdir -p "$HOME/.config/gcp"
+    printf 'scopes = a, b\nmax_header_length = 60\n' > "$HOME/.config/gcp/config"
+    echo 'max_header_length = 80' > .gcprc
+    run gcp config
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"scopes"*"a, b"*"config:1"* ]]
+    [[ "$output" == *"max_header_length"*"80"*".gcprc:1"* ]]
+    [ "$(gcp config max_header_length)" = "80" ]
+    [ "$(GCP_MAX_HEADER_LENGTH=100 gcp config max_header_length)" = "100" ]
+    [ "$(gcp config scopes)" = "a,b" ]
+}
+
+@test "status shows the .gcprc rules" {
+    printf 'scopes = api\nrequire_scope = true\n' > .gcprc
+    run gcp status
+    [[ "$output" == *"Rules:   .gcprc (scopes: api; scope required)"* ]]
 }

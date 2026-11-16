@@ -13,6 +13,24 @@ _gcp_changed_files() {
     _files
 }
 
+# Scopes from the gcp config (.gcprc), after "type(" was typed
+_gcp_scopes() {
+    local -a scopes
+    scopes=(${(s:,:)"$(command gcp config scopes 2>/dev/null)"})
+    (( ${#scopes} )) || return 1
+    compset -P '*\('
+    _wanted scopes expl 'scope (.gcprc)' compadd -S '): ' -- $scopes
+}
+
+# Commit type, or the scope once "type(" is typed
+_gcp_message() {
+    if [[ $PREFIX =~ '^[a-z]+\(' ]]; then
+        _gcp_scopes
+    else
+        _gcp_types
+    fi
+}
+
 _gcp_types() {
     local -a types
     types=(
@@ -46,6 +64,7 @@ _gcp() {
         'pr:push and open a pull request'
         'changelog:features, fixes and breaking changes since the last tag'
         'release:tag the next version and create the GitHub release'
+        'config:show the settings from .gcprc and ~/.config/gcp/config'
     )
     opts=(
         '(-i --interactive)'{-i,--interactive}'[pick the files from a list]'
@@ -65,8 +84,12 @@ _gcp() {
                 '(- *)'{-h,--help}'[show help]' \
                 '(- *)'{-v,-V,--version}'[show version]'
         else
-            _describe -t commands 'gcp command' subcmds
-            _gcp_types
+            if [[ $PREFIX =~ '^[a-z]+\(' ]]; then
+                _gcp_scopes
+            else
+                _describe -t commands 'gcp command' subcmds
+                _gcp_types
+            fi
         fi
         return
     fi
@@ -85,6 +108,9 @@ _gcp() {
             ;;
         undo|sync)
             _arguments '(-y --yes)'{-y,--yes}'[skip the confirmation prompt]'
+            ;;
+        config)
+            (( CURRENT == 2 )) && _values 'setting' scopes require_scope max_header_length base_branch
             ;;
         new)
             if (( CURRENT == 2 )); then
@@ -116,7 +142,7 @@ _gcp() {
             ;;
         amend)
             if [[ ${words[CURRENT-1]} == -m ]]; then
-                _gcp_types
+                _gcp_message
             elif [[ $PREFIX == -* ]]; then
                 _arguments -s $opts '-m[new commit message]'
             else

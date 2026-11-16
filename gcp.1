@@ -50,6 +50,9 @@ gcp \- stage, commit and push all changes in one step, with safety checks
 .RB [ \-n ]
 .RB [ major | minor | patch ]
 .br
+.B gcp config
+.RI [ name ]
+.br
 .B gcp
 .RB \-h | \-\-help | \-v | \-V | \-\-version
 .SH DESCRIPTION
@@ -221,6 +224,96 @@ shows version and notes without tagging.
 .B release
 does not change files; if the project stores its version in a file,
 commit that change first.
+.SH CONFIGURATION
+A repository can set its own rules in a file
+.B .gcprc
+in its top directory, committed like
+.BR .gitignore ,
+so they apply to everyone working on it. Personal defaults for all
+repositories go into
+.BR ~/.config/gcp/config
+(or
+.BR $XDG_CONFIG_HOME/gcp/config ).
+Both files have the same format. Without them,
+.B gcp
+behaves as described in this manual.
+.PP
+Later sources win:
+.B ~/.config/gcp/config
+\(->
+.B .gcprc
+\(->
+.B GCP_*
+environment variables.
+.PP
+Each line is
+.IB name " = " value\fR;
+blank lines and lines starting with
+.B #
+or
+.B ;
+are ignored. Values may be quoted. The file is only parsed, never run as
+a script, so a
+.B .gcprc
+in a cloned repository cannot execute commands. Unknown names and
+invalid values are errors, so typos do not go unnoticed.
+.TP
+.BI "scopes = " "scope, scope, ..."
+Only these scopes are allowed. A commit with another scope is rejected,
+with a hint if it looks like a typo. Commits without scope are still
+allowed, unless
+.B require_scope
+is set. Environment:
+.BR GCP_SCOPES .
+.TP
+.BR "require_scope = " true | false
+Every commit needs a scope (default false).
+Revert commits made by
+.B gcp undo
+are exempt. Environment:
+.BR GCP_REQUIRE_SCOPE .
+.TP
+.BI "max_header_length = " n
+Maximum length of the commit header including the gitmoji, 20 to 200
+(default 72). Environment:
+.BR GCP_MAX_HEADER_LENGTH .
+.TP
+.BI "base_branch = " branch
+The base branch for
+.BR new ", " sync ", " pr " and " release ,
+instead of detecting it. It is protected like
+.BR main :
+direct commits need
+.BR ALLOW_MAIN=1 .
+Environment:
+.BR GCP_BASE_BRANCH .
+.PP
+.B SKIP_GITLEAKS
+and
+.B ALLOW_MAIN
+cannot be set in a file, only per call, so a repository cannot switch off
+the safety checks.
+.TP
+.B config \fR[\fIname\fR]
+Shows all settings with their value and source (file and line, environment
+or default). With a
+.IR name ,
+prints only that value, e.g.
+.BR "gcp config scopes" .
+The zsh completion uses this to suggest scopes after
+.BR "type(" .
+.PP
+Example
+.BR .gcprc :
+.PP
+.RS
+.nf
+# Rules for commits in this repository
+scopes = api, ui, docs, auth
+require_scope = true
+max_header_length = 100
+.fi
+.RE
 .SH COMMIT MESSAGE
 The header must follow Conventional Commits 1.0.0:
 .PP
@@ -403,6 +496,10 @@ or
 .TP
 .B SKIP_GITLEAKS=1
 Skip the content secret scan. Not recommended.
+.TP
+.BR GCP_SCOPES ", " GCP_REQUIRE_SCOPE ", " GCP_MAX_HEADER_LENGTH ", " GCP_BASE_BRANCH
+Override the settings of the same name, see
+.BR CONFIGURATION .
 .SH EXIT STATUS
 .TP
 .B 0
@@ -493,6 +590,13 @@ Released v1.4.3
 bash >= 4, git >= 2.22,
 .BR gitleaks (1)
 >= 8.19.
+.SH FILES
+.TP
+.B .gcprc
+Rules for one repository, in its top directory.
+.TP
+.B ~/.config/gcp/config
+Personal defaults for all repositories.
 .SH SEE ALSO
 .BR git-commit (1),
 .BR git-push (1),

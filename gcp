@@ -12,6 +12,10 @@
 #   gcp pr [-y] [--draft | --merge]
 #   gcp changelog [--all] [since]
 #   gcp release [-y] [-n] [major|minor|patch]
+#   gcp config [name]
+#
+# Settings: ~/.config/gcp/config, then .gcprc in the repository, then GCP_*
+# environment variables (scopes, require_scope, max_header_length, base_branch).
 #
 #   -y, --yes          skip the confirmation prompt (also: GCP_YES=1)
 #   -i, --interactive  pick the files to commit from a list (fzf if installed)
@@ -36,7 +40,7 @@
 #   GCP_NO_FZF=1      use the numbered list for -i even if fzf is installed
 set -euo pipefail
 
-GCP_VERSION="1.1.0"
+GCP_VERSION="1.2.0"
 MAX_FILE_MIB=100
 MAX_HEADER_LENGTH=72
 CC_TYPES='feat|fix|build|chore|ci|docs|style|refactor|perf|test|revert'
@@ -77,6 +81,206 @@ GIT_DIR=""
 REPO_ROOT=""
 BRANCH=""
 REMOTE=""
+
+# ---------------------------------------------------------------------------
+# Configuration: ~/.config/gcp/config, then .gcprc in the repo, then GCP_* env
+# ---------------------------------------------------------------------------
+
+CONFIG_KEYS=(scopes require_scope max_header_length base_branch)
+declare -A CFG=(
+    [scopes]=""
+    [require_scope]="false"
+    [max_header_length]="$MAX_HEADER_LENGTH"
+    [base_branch]=""
+)
+declare -A CFG_SRC=(
+    [scopes]="default"
+    [require_scope]="default"
+    [max_header_length]="default"
+    [base_branch]="default"
+)
+SCOPES=()           # allowed scopes, empty means any
+CONFIG_LOADED=0
+
+global_config_file() {
+    echo "${XDG_CONFIG_HOME:-$HOME/.config}/gcp/config"
+}
+
+# config_set <key> <value> <source>: validates and stores one setting
+config_set() {
+    local key="$1" value="$2" src="$3" item
+    case "$key" in
+        scopes)
+            # "api, ui , docs" -> "api,ui,docs"
+            value="$(printf '%s' "$value" | tr -d '[:space:]' | sed -E 's/,+/,/g; s/^,//; s/,$//')"
+            local -a items=()
+            IFS=',' read -r -a items <<< "$value"
+            for item in ${items[@]+"${items[@]}"}; do
+                [[ "$item" =~ ^[a-z0-9._/-]+$ ]] \
+                    || die "$src: invalid scope '$item' (use lowercase letters, digits, . _ / -)."
+            done
+            ;;
+        require_scope)
+            case "${value,,}" in
+                true|yes|on|1)   value=true ;;
+                false|no|off|0)  value=false ;;
+                *) die "$src: require_scope must be true or false (got: $value)." ;;
+            esac
+            ;;
+        max_header_length)
+            if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value < 20 || value > 200 )); then
+                die "$src: max_header_length must be a number from 20 to 200 (got: $value)."
+            fi
+            ;;
+        base_branch)
+            git check-ref-format --branch "$value" >/dev/null 2>&1 \
+                || die "$src: base_branch '$value' is not a valid branch name."
+            ;;
+        skip_gitleaks|allow_main|yes|gcp_yes)
+            die "$src: '$key' cannot be set in a config file. Safety checks can only be turned off per call (SKIP_GITLEAKS=1, ALLOW_MAIN=1)."
+            ;;
+        *)
+            die "$src: unknown setting '$key'. Known: ${CONFIG_KEYS[*]}"
+            ;;
+    esac
+    CFG[$key]="$value"
+    CFG_SRC[$key]="$src"
+}
+
+# read_config_file <file> <label>: "key = value" lines; never executed
+read_config_file() {
+    local file="$1" label="$2" line key value n=0
+    [[ -f "$file" ]] || return 0
+    [[ -r "$file" ]] || die "$label is not readable."
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        (( n++ )) || true
+        line="${line%$'\r'}"
+        # strip leading/trailing whitespace; skip blank lines and comments
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" == \#* || "$line" == \;* ]] && continue
+        [[ "$line" =~ ^([A-Za-z_]+)[[:space:]]*=[[:space:]]*(.*)$ ]] \
+            || die "$label line $n: expected 'name = value', got: $line"
+        key="${BASH_REMATCH[1],,}"
+        value="${BASH_REMATCH[2]}"
+        # optional quotes around the value
+        if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then
+            value="${BASH_REMATCH[1]}"
+        fi
+        config_set "$key" "$value" "$label:$n"
+    done < "$file"
+}
+
+# Loads all config sources once; needs REPO_ROOT for .gcprc
+load_config() {
+    (( CONFIG_LOADED )) && return 0
+    CONFIG_LOADED=1
+    local gfile key env_name
+    gfile="$(global_config_file)"
+    read_config_file "$gfile" "${gfile/#"$HOME"/\~}"
+    [[ -n "$REPO_ROOT" ]] && read_config_file "$REPO_ROOT/.gcprc" ".gcprc"
+    for key in "${CONFIG_KEYS[@]}"; do
+        env_name="GCP_${key^^}"
+        if [[ -n "${!env_name:-}" ]]; then
+            config_set "$key" "${!env_name}" "$env_name"
+        fi
+    done
+
+    MAX_HEADER_LENGTH="${CFG[max_header_length]}"
+    SCOPES=()
+    [[ -n "${CFG[scopes]}" ]] && IFS=',' read -r -a SCOPES <<< "${CFG[scopes]}"
+    return 0
+}
+
+# check_scope <scope or empty> <type>: enforces scopes / require_scope
+check_scope() {
+    local scope="$1" type="$2" s
+    if [[ -z "$scope" ]]; then
+        # gcp undo writes "revert: ..." without scope; never block that
+        if [[ "${CFG[require_scope]}" == true && "$type" != revert ]]; then
+            {
+                echo "Error: a scope is required in this repository (require_scope in ${CFG_SRC[require_scope]})."
+                echo "  Example:  $type(${SCOPES[0]:-api}): ..."
+                (( ${#SCOPES[@]} )) && echo "  Scopes:   ${SCOPES[*]}"
+            } >&2
+            exit 1
+        fi
+        return 0
+    fi
+    (( ${#SCOPES[@]} )) || return 0
+    for s in "${SCOPES[@]}"; do
+        [[ "$s" == "$scope" ]] && return 0
+    done
+    {
+        echo "Error: scope '$scope' is not allowed here (scopes in ${CFG_SRC[scopes]})."
+        echo "  Scopes:   ${SCOPES[*]}"
+        # Hint for a likely typo: same first letter or same letters
+        local hint=""
+        for s in "${SCOPES[@]}"; do
+            if [[ "$(sorted_letters "$s")" == "$(sorted_letters "$scope")" ]]; then
+                hint="$s"; break
+            fi
+        done
+        [[ -n "$hint" ]] && echo "  Did you mean '$hint'?"
+    } >&2
+    exit 1
+}
+
+sorted_letters() {
+    printf '%s' "$1" | fold -w1 | sort | tr -d '\n'
+}
+
+# ---------------------------------------------------------------------------
+# gcp config [key]
+# ---------------------------------------------------------------------------
+
+cmd_config() {
+    [[ $# -le 1 ]] || die "usage: gcp config [name]"
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        require_repo
+    else
+        load_config
+    fi
+
+    if [[ $# -eq 1 ]]; then
+        local key="${1,,}"
+        [[ " ${CONFIG_KEYS[*]} " == *" $key "* ]] || die "unknown setting '$1'. Known: ${CONFIG_KEYS[*]}"
+        echo "${CFG[$key]}"
+        return 0
+    fi
+
+    local gfile key value
+    gfile="$(global_config_file)"
+    echo "Files (later ones win, then GCP_* environment variables):"
+    if [[ -f "$gfile" ]]; then
+        echo "  ${gfile/#"$HOME"/\~}"
+    else
+        echo "  ${C_DIM}${gfile/#"$HOME"/\~} (not found)${C_RESET}"
+    fi
+    if [[ -n "$REPO_ROOT" && -f "$REPO_ROOT/.gcprc" ]]; then
+        echo "  .gcprc"
+    else
+        echo "  ${C_DIM}.gcprc (not found)${C_RESET}"
+    fi
+    echo
+    echo "Settings:"
+    for key in "${CONFIG_KEYS[@]}"; do
+        value="${CFG[$key]}"
+        case "$key" in
+            scopes)      [[ -n "$value" ]] || value="(any)" ;;
+            base_branch)
+                if [[ -z "$value" ]]; then
+                    if [[ -n "$REPO_ROOT" ]]; then
+                        value="(auto: $(default_branch "$(pick_remote)"))"
+                    else
+                        value="(auto)"
+                    fi
+                fi
+                ;;
+        esac
+        printf '  %-18s %-30s %s\n' "$key" "${value//,/, }" "${C_DIM}${CFG_SRC[$key]}${C_RESET}"
+    done
+}
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -124,6 +328,16 @@ Environment:
   SKIP_GITLEAKS=1     skip the secret scan (not recommended)
   GCP_YES=1           same as -y
   GCP_NO_FZF=1        use the numbered list for -i even if fzf is installed
+  GCP_SCOPES, GCP_REQUIRE_SCOPE, GCP_MAX_HEADER_LENGTH, GCP_BASE_BRANCH
+                      override the settings from .gcprc
+
+Settings:
+  gcp config [name]           show the settings and where they come from
+  .gcprc in the repository (or ~/.config/gcp/config), "name = value" lines:
+    scopes = api, ui, docs    only these scopes are allowed
+    require_scope = true      every commit needs a scope
+    max_header_length = 100   instead of 72
+    base_branch = develop     base for new/sync/pr/release, protected like main
 
 Types (gitmoji is added automatically):
   feat ✨  fix 🐛  docs 📝  style 🎨  refactor ♻️  perf ⚡️
@@ -151,7 +365,7 @@ EOF
 USAGE="usage: gcp [-y] [-i] \"<type>[(scope)][!]: <description>\" [--] [path...] (quote the message)
        gcp amend [-y] [-i] [-m \"<message>\"] [--] [path...]
        gcp undo [-y] | status | history [n] [type] | -h | -v
-       gcp new <type> <name> | sync | pr [--draft|--merge] | changelog | release"
+       gcp new <type> <name> | sync | pr [--draft|--merge] | changelog | release | config"
 
 # True if the word is a gitmoji shortcode (:bug:) or starts with a unicode emoji.
 # Checked on UTF-8 bytes: U+1Fxxx (F0 9F ..) and symbols U+2190-U+2BFF (E2 86..AF ..).
@@ -166,6 +380,7 @@ require_repo() {
     git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not a git repository."
     GIT_DIR="$(git rev-parse --git-dir)"
     REPO_ROOT="$(git rev-parse --show-toplevel)"
+    load_config
 }
 
 require_commits() {
@@ -200,10 +415,15 @@ require_no_operation() {
     [[ -z "$op" ]] || die "a $op is in progress. Finish or abort it first."
 }
 
+# main, master and the configured base_branch take no direct commits
+is_protected_branch() {
+    [[ "$1" == "main" || "$1" == "master" || ( -n "${CFG[base_branch]}" && "$1" == "${CFG[base_branch]}" ) ]]
+}
+
 require_branch() {
     BRANCH="$(git branch --show-current)"
     [[ -n "$BRANCH" ]] || die "detached HEAD, check out a branch first."
-    if [[ "$BRANCH" == "main" || "$BRANCH" == "master" ]] && [[ "${ALLOW_MAIN:-0}" != "1" ]]; then
+    if is_protected_branch "$BRANCH" && [[ "${ALLOW_MAIN:-0}" != "1" ]]; then
         die "refusing to commit directly to $BRANCH. Use a feature or release branch, or run with ALLOW_MAIN=1."
     fi
 }
@@ -255,9 +475,9 @@ is_merge_commit() {
 # Commit message
 # ---------------------------------------------------------------------------
 
-# parse_message "<raw message>"
-# Validates Conventional Commits, adds the gitmoji and sets
-# CC_TYPE, IS_BREAKING, HEADER, BODY and MESSAGE.
+# parse_message "<raw message>" [check_scope: 1|0]
+# Validates Conventional Commits (and the configured scopes), adds the gitmoji
+# and sets CC_TYPE, IS_BREAKING, HEADER, BODY and MESSAGE.
 parse_message() {
     local raw raw_header description first_word rest
     raw="$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
@@ -280,6 +500,10 @@ parse_message() {
 
     CC_TYPE="${BASH_REMATCH[1]}"
     local cc_scope="${BASH_REMATCH[2]}" cc_bang="${BASH_REMATCH[3]}"
+    if [[ "${2:-1}" == 1 ]]; then
+        local scope_name="${cc_scope#(}"
+        check_scope "${scope_name%)}" "$CC_TYPE"
+    fi
     description="${BASH_REMATCH[4]}"
 
     IS_BREAKING=0
@@ -621,8 +845,8 @@ cmd_commit() {
         set_paths "$@"
     fi
 
-    parse_message "$message_arg"
     require_repo
+    parse_message "$message_arg"
     require_tools
     require_no_operation
     validate_paths
@@ -923,7 +1147,7 @@ cmd_status() {
     fi
 
     # Branch rules
-    if [[ "$branch" == "main" || "$branch" == "master" ]] && [[ "${ALLOW_MAIN:-0}" != "1" ]]; then
+    if [[ -n "$branch" ]] && is_protected_branch "$branch" && [[ "${ALLOW_MAIN:-0}" != "1" ]]; then
         warnings+=("on $branch: gcp needs ALLOW_MAIN=1")
     fi
     if [[ "$branch" == release/* ]]; then
@@ -939,6 +1163,20 @@ cmd_status() {
         else
             warnings+=("release branches must be named release/X.Y")
         fi
+    fi
+
+    # Repository rules from .gcprc
+    if [[ -f "$REPO_ROOT/.gcprc" ]]; then
+        local rules=()
+        (( ${#SCOPES[@]} )) && rules+=("scopes: ${SCOPES[*]}")
+        [[ "${CFG[require_scope]}" == true ]] && rules+=("scope required")
+        [[ "${CFG_SRC[max_header_length]}" != default ]] && rules+=("max ${MAX_HEADER_LENGTH} chars")
+        [[ -n "${CFG[base_branch]}" ]] && rules+=("base ${CFG[base_branch]}")
+        local joined="" r
+        for r in ${rules[@]+"${rules[@]}"}; do
+            joined+="${joined:+; }$r"
+        done
+        echo "Rules:   .gcprc${joined:+ ($joined)}"
     fi
 
     # Operation in progress
@@ -1060,9 +1298,13 @@ pick_remote() {
     fi
 }
 
-# default_branch [remote]: <remote>/HEAD, else main, else master
+# default_branch [remote]: base_branch from the config, else <remote>/HEAD, else main, else master
 default_branch() {
     local remote="${1:-}" ref
+    if [[ -n "${CFG[base_branch]}" ]]; then
+        echo "${CFG[base_branch]}"
+        return
+    fi
     if [[ -n "$remote" ]] && ref="$(git symbolic-ref -q --short "refs/remotes/$remote/HEAD" 2>/dev/null)"; then
         echo "${ref#"$remote"/}"
         return
@@ -1244,7 +1486,7 @@ cmd_pr() {
         title="${commits[0]#* }"
     elif [[ "$BRANCH" =~ ^(${CC_TYPES})/(.+)$ ]]; then
         local words="${BASH_REMATCH[2]//[-_\/]/ }"
-        parse_message "${BASH_REMATCH[1]}: $words"
+        parse_message "${BASH_REMATCH[1]}: $words" 0
         title="$HEADER"
     else
         title="${commits[0]#* }"
@@ -1564,5 +1806,6 @@ case "$1" in
     pr)      shift; cmd_pr "$@" ;;
     changelog) shift; cmd_changelog "$@" ;;
     release) shift; cmd_release "$@" ;;
+    config)  shift; cmd_config "$@" ;;
     *)       cmd_commit "$@" ;;
 esac

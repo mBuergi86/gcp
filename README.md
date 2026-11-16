@@ -32,6 +32,7 @@ Commit and push these changes? [y/N] y
 - **Release tagging:** a `fix` on `release/X.Y` creates and pushes the next patch tag.
 - **Branch workflow:** `gcp new` creates a branch from the latest `main`, `gcp sync` keeps it up to date, `gcp pr` opens the pull request (and merges it with `--merge`).
 - **Changelog and releases:** `gcp changelog` groups the commits since the last tag, `gcp release` picks the next version from them and publishes the GitHub release.
+- **Rules per repository:** a `.gcprc` file sets allowed scopes, a required scope, the header length or the base branch for everyone working on the repo.
 - **Tab completion for zsh:** subcommands, commit types (with the opening quote) and changed files.
 
 ## Requirements
@@ -120,6 +121,12 @@ gcp sync                              # rebase the branch onto the latest main
 gcp pr [--draft | --merge]            # push and open a pull request
 gcp changelog [--all] [since]         # changes since the last tag, as Markdown
 gcp release [-n] [major|minor|patch]  # tag the next version and publish the release
+```
+
+Settings (see [Configuration](#configuration-gcprc)):
+
+```sh
+gcp config [name]                     # show the settings and where they come from
 ```
 
 Without paths, `gcp` commits **all** changes. With paths, only those files and directories are staged, checked and committed. Everything else stays as it is, even if it is already staged.
@@ -371,6 +378,54 @@ It shows the version and the changelog, asks, then creates and pushes the tag. W
 `gcp release` does not edit files. If your project keeps its version in a file (like `GCP_VERSION` in `gcp`), commit that change first.
 
 This is separate from the automatic patch tags on `release/X.Y` branches described below.
+
+## Configuration (.gcprc)
+
+Without any configuration, `gcp` works as described above. A repository can set its own rules in a file **`.gcprc`** in its top directory. Like `.gitignore`, it is committed, so the rules apply to everyone working on the repo. git and other tools ignore the file, only `gcp` reads it.
+
+```ini
+# .gcprc - rules for commits in this repository
+scopes = api, ui, docs, auth
+require_scope = true
+max_header_length = 100
+base_branch = develop
+```
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `scopes` | any | Only these scopes are allowed. `fix(aip): …` is rejected with *Did you mean 'api'?* |
+| `require_scope` | `false` | Every commit needs a scope. Reverts from `gcp undo` are exempt. |
+| `max_header_length` | `72` | Maximum header length including the gitmoji (20–200). |
+| `base_branch` | auto (`origin/HEAD`, `main`, `master`) | Base for `new`, `sync`, `pr` and `release`. It is protected like `main`. |
+
+Personal defaults for all your repositories go into `~/.config/gcp/config`, same format. Later sources win:
+
+```
+~/.config/gcp/config  →  .gcprc  →  environment (GCP_SCOPES, GCP_REQUIRE_SCOPE, GCP_MAX_HEADER_LENGTH, GCP_BASE_BRANCH)
+```
+
+`gcp config` shows what is in effect and where each value comes from:
+
+```console
+$ gcp config
+Files (later ones win, then GCP_* environment variables):
+  ~/.config/gcp/config (not found)
+  .gcprc
+
+Settings:
+  scopes             api, ui, docs, auth            .gcprc:2
+  require_scope      true                           .gcprc:3
+  max_header_length  100                            .gcprc:4
+  base_branch        develop                        .gcprc:5
+```
+
+`gcp status` lists the rules too, and the zsh completion suggests the scopes: `gcp "fix(<Tab>` offers `api`, `ui`, `docs`, `auth`.
+
+**Safe by design:**
+
+- The file is only read line by line as `name = value`, never run as a script. A `.gcprc` in a cloned repository cannot execute commands on your machine.
+- `SKIP_GITLEAKS` and `ALLOW_MAIN` cannot be set in a file, only per call. A repository cannot quietly switch off the safety checks.
+- Unknown names and invalid values are errors, so a typo like `scope = api` does not go unnoticed.
 
 ## Safety checks
 
