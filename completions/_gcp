@@ -1,0 +1,96 @@
+#compdef gcp
+# zsh completion for gcp (https://github.com/mBuergi86/gcp)
+
+# Files with changes (modified, deleted, untracked, staged), relative to $PWD.
+_gcp_changed_files() {
+    local -a files
+    files=(
+        ${(f)"$(git ls-files --modified --deleted --others --exclude-standard 2>/dev/null)"}
+        ${(f)"$(git diff --cached --name-only --relative 2>/dev/null)"}
+    )
+    files=(${(u)files})
+    (( ${#files} )) && _describe -t files 'changed file' files && return 0
+    _files
+}
+
+_gcp_types() {
+    local -a types
+    types=(
+        'feat:✨ new feature'
+        'fix:🐛 bug fix'
+        'docs:📝 documentation'
+        'style:🎨 formatting'
+        'refactor:♻️ restructure code'
+        'perf:⚡️ performance'
+        'test:✅ tests'
+        'build:📦️ build system, dependencies'
+        'ci:👷 CI configuration'
+        'chore:🔧 maintenance'
+        'revert:⏪️ revert a commit'
+    )
+    # The message must be one argument: open a quote if the user has not.
+    local -a qopt
+    [[ -z $compstate[quote] ]] && qopt=(-P '"')
+    _describe -t types 'commit type' types $qopt -S ': '
+}
+
+_gcp() {
+    local -a subcmds opts
+    subcmds=(
+        'status:show branch, changes and what gcp would block'
+        'history:show the last commits'
+        'undo:undo the last commit'
+        'amend:add changes to the last commit'
+    )
+    opts=(
+        '(-i --interactive)'{-i,--interactive}'[pick the files from a list]'
+        '(-y --yes)'{-y,--yes}'[skip the confirmation prompt]'
+    )
+
+    # Skip leading options to find the subcommand / message position.
+    local i=2
+    while (( i < CURRENT )) && [[ ${words[i]} == -* && ${words[i]} != -- ]]; do
+        (( i++ ))
+    done
+    [[ ${words[i]} == -- ]] && (( i++ ))
+
+    if (( CURRENT == i )); then
+        if [[ $PREFIX == -* ]]; then
+            _arguments -s $opts \
+                '(- *)'{-h,--help}'[show help]' \
+                '(- *)'{-V,--version}'[show version]'
+        else
+            _describe -t commands 'gcp command' subcmds
+            _gcp_types
+        fi
+        return
+    fi
+
+    case ${words[i]} in
+        status)
+            ;;
+        history)
+            local -a htypes
+            htypes=(feat fix docs style refactor perf test build ci chore revert breaking)
+            _alternative 'count:number of commits:(5 10 20 50)' "types:type:($htypes)"
+            ;;
+        undo)
+            _arguments '(-y --yes)'{-y,--yes}'[skip the confirmation prompt]'
+            ;;
+        amend)
+            if [[ ${words[CURRENT-1]} == -m ]]; then
+                _gcp_types
+            elif [[ $PREFIX == -* ]]; then
+                _arguments -s $opts '-m[new commit message]'
+            else
+                _gcp_changed_files
+            fi
+            ;;
+        *)
+            # After the message: paths.
+            _gcp_changed_files
+            ;;
+    esac
+}
+
+_gcp "$@"

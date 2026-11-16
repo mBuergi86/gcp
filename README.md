@@ -30,6 +30,7 @@ Commit and push these changes? [y/N] y
 - **Single files or all changes:** commit everything, only the paths you name, or pick files interactively (`-i`, with fzf if installed).
 - **Rebase before push:** if the branch has an upstream, `gcp` runs `git pull --rebase --autostash` first, so other uncommitted changes are kept.
 - **Release tagging:** a `fix` on `release/X.Y` creates and pushes the next patch tag.
+- **Tab completion for zsh:** subcommands, commit types (with the opening quote) and changed files.
 
 ## Requirements
 
@@ -53,19 +54,22 @@ Or in one line, without cloning:
 curl -fsSL https://raw.githubusercontent.com/mBuergi86/gcp/main/install.sh | bash
 ```
 
-This installs `gcp` to `~/.local/bin` and the man page to `~/.local/share/man/man1`, so no root is needed. The installer checks the requirements and warns if `~/.local/bin` is not in your `PATH`. Afterwards `man gcp` shows the full manual.
+This installs `gcp` to `~/.local/bin`, the man page to `~/.local/share/man/man1` and the zsh completion to `~/.local/share/zsh/site-functions`, so no root is needed. The installer checks the requirements and warns if `~/.local/bin` is not in your `PATH`. Afterwards `man gcp` shows the full manual.
 
 | Option | Effect |
 | --- | --- |
-| `--prefix DIR` | Install to `DIR/bin` and `DIR/share/man/man1` instead, e.g. `sudo ./install.sh --prefix /usr/local` |
-| `--zshrc` | Add `unalias gcp` to `~/.zshrc` (see below) |
-| `--uninstall` | Remove `gcp` and its man page again |
+| `--prefix DIR` | Install under `DIR` instead, e.g. `sudo ./install.sh --prefix /usr/local` |
+| `--version X.Y.Z` | Install a [release](https://github.com/mBuergi86/gcp/releases) instead of the latest `main` |
+| `--zshrc` | Set up `~/.zshrc`: remove the oh-my-zsh alias and load the tab completion (see below) |
+| `--uninstall` | Remove `gcp`, its man page and the completion again |
 
 With the one-line install, pass options after `bash -s --`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/mBuergi86/gcp/main/install.sh | bash -s -- --zshrc
+curl -fsSL https://raw.githubusercontent.com/mBuergi86/gcp/main/install.sh | bash -s -- --zshrc --version 1.0.0
 ```
+
+`gcp --version` shows the installed version.
 
 ### oh-my-zsh users
 
@@ -75,10 +79,23 @@ The oh-my-zsh `git` plugin defines `gcp` as an alias for `git cherry-pick`, whic
 unalias gcp 2>/dev/null
 ```
 
+### Tab completion (zsh)
+
+`--zshrc` also adds these lines, so <kbd>Tab</kbd> completes subcommands, commit types and changed files:
+
+```zsh
+# gcp: tab completion
+fpath=(~/.local/share/zsh/site-functions $fpath)
+autoload -Uz _gcp && (( $+functions[compdef] )) && compdef _gcp gcp
+```
+
+`gcp fe<Tab>` becomes `gcp "feat: `, so you only type the description and the closing quote. After the message, <kbd>Tab</kbd> offers the files that have changes.
+
 ## Usage
 
 ```sh
 gcp [-y|--yes] [-i|--interactive] "<type>[(scope)][!]: [gitmoji] <description>" [--] [path...]
+gcp -h | --help | -V | --version
 ```
 
 The message must be passed as **one quoted argument**, before any paths. A body and footers go on further lines inside the same quotes.
@@ -336,6 +353,13 @@ bats test/
 ```
 
 GitHub Actions runs both on every push and pull request.
+
+To make a release, raise `GCP_VERSION` in `gcp`, commit, then tag and publish it:
+
+```sh
+git tag -a v1.1.0 -m "gcp 1.1.0" && git push origin v1.1.0
+gh release create v1.1.0 --generate-notes
+```
 
 ## Exit status
 

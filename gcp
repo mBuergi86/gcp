@@ -10,6 +10,7 @@
 #
 #   -y, --yes          skip the confirmation prompt (also: GCP_YES=1)
 #   -i, --interactive  pick the files to commit from a list (fzf if installed)
+#   -V, --version      print the version
 #   path...            commit only these files/directories (default: all changes)
 #
 # Commit messages must follow Conventional Commits 1.0.0:
@@ -30,6 +31,7 @@
 #   GCP_NO_FZF=1      use the numbered list for -i even if fzf is installed
 set -euo pipefail
 
+GCP_VERSION="1.0.0"
 MAX_FILE_MIB=100
 MAX_HEADER_LENGTH=72
 CC_TYPES='feat|fix|build|chore|ci|docs|style|refactor|perf|test|revert'
@@ -99,6 +101,7 @@ Options:
   -i, --interactive   pick the files from a list (fzf with diff preview if installed)
   -y, --yes           skip the confirmation prompt
   -h, --help          show this help
+  -V, --version       show the version
 
 Environment:
   ALLOW_MAIN=1        allow committing directly to main/master
@@ -127,7 +130,7 @@ EOF
 
 USAGE="usage: gcp [-y] [-i] \"<type>[(scope)][!]: <description>\" [--] [path...] (quote the message)
        gcp amend [-y] [-i] [-m \"<message>\"] [--] [path...]
-       gcp undo [-y] | status | history [n] [type] | -h"
+       gcp undo [-y] | status | history [n] [type] | -h | -V"
 
 # True if the word is a gitmoji shortcode (:bug:) or starts with a unicode emoji.
 # Checked on UTF-8 bytes: U+1Fxxx (F0 9F ..) and symbols U+2190-U+2BFF (E2 86..AF ..).
@@ -1031,6 +1034,7 @@ while [[ $# -gt 0 ]]; do
         -i|--interactive)  INTERACTIVE=1; shift ;;
         -iy|-yi)           ASSUME_YES=1; INTERACTIVE=1; shift ;;
         -h|--help)         show_help; exit 0 ;;
+        -V|--version)      echo "gcp $GCP_VERSION"; exit 0 ;;
         --)                shift; break ;;
         -*)                die "unknown option: $1
 $USAGE" ;;

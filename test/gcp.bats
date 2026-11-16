@@ -66,6 +66,13 @@ first_commit() {
     [[ "$output" == *"gcp undo"* ]]
 }
 
+@test "--version and -V print the version" {
+    run gcp --version
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ ^gcp\ [0-9]+\.[0-9]+\.[0-9]+$ ]]
+    [ "$(gcp -V)" = "$output" ]
+}
+
 @test "unknown option is rejected" {
     run gcp --nope "fix: x"
     [ "$status" -eq 1 ]
@@ -551,4 +558,37 @@ local_commit() {
     run gcp amend -y -m "bad message"
     [ "$status" -eq 1 ]
     [[ "$output" == *"Conventional Commits"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# install.sh and completion
+# ---------------------------------------------------------------------------
+
+@test "install.sh: installs, sets up ~/.zshrc once, uninstalls" {
+    local inst="$BATS_TEST_DIRNAME/../install.sh" prefix="$TMP/prefix"
+    touch "$HOME/.zshrc"
+    run bash "$inst" --prefix "$prefix" --zshrc
+    [ "$status" -eq 0 ]
+    [ -x "$prefix/bin/gcp" ]
+    [ -f "$prefix/share/man/man1/gcp.1" ]
+    [ -f "$prefix/share/zsh/site-functions/_gcp" ]
+    [[ "$output" == *"Installed gcp "* ]]
+    bash "$inst" --prefix "$prefix" --zshrc >/dev/null
+    [ "$(grep -c '^unalias gcp' "$HOME/.zshrc")" -eq 1 ]
+    [ "$(grep -c 'compdef _gcp gcp' "$HOME/.zshrc")" -eq 1 ]
+    run bash "$inst" --prefix "$prefix" --uninstall
+    [ "$status" -eq 0 ]
+    [ ! -e "$prefix/bin/gcp" ]
+    [ ! -e "$prefix/share/zsh/site-functions/_gcp" ]
+}
+
+@test "install.sh: rejects a malformed --version" {
+    run bash "$BATS_TEST_DIRNAME/../install.sh" --version 1.0
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"must look like 1.0.0"* ]]
+}
+
+@test "zsh completion has valid syntax" {
+    command -v zsh >/dev/null || skip "zsh not installed"
+    zsh -n "$BATS_TEST_DIRNAME/../completions/_gcp"
 }
