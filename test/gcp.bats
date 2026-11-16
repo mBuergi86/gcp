@@ -627,7 +627,9 @@ fake_gh() {
 #!/usr/bin/env bash
 echo "$*" >> "$GH_LOG"
 case "$1 $2" in
-    "pr view")   [[ -n "${GH_EXISTING:-}" ]] && echo "$GH_EXISTING"; exit 0 ;;
+    "pr view")   if [[ "$*" == *title,number* ]]; then echo "feat: ✨ edited title (#7)"
+                 elif [[ -n "${GH_EXISTING:-}" ]]; then echo "$GH_EXISTING"; fi
+                 exit 0 ;;
     "pr create") echo "https://github.com/x/y/pull/7" ;;
 esac
 exit 0
@@ -763,7 +765,7 @@ GH
     echo x > x.txt; git add x.txt; git commit -q -m "fix: 🐛 crash"
     run gcp pr -y --merge
     [ "$status" -eq 0 ]
-    grep -q -- "pr merge fix/crash --squash --delete-branch" "$GH_LOG"
+    grep -q -- "pr merge fix/crash --squash --delete-branch --subject feat: ✨ edited title (#7)" "$GH_LOG"
     [ "$(git branch --show-current)" = "main" ]
     ! git rev-parse -q --verify refs/heads/fix/crash
 }
