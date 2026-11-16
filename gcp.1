@@ -31,6 +31,25 @@ gcp \- stage, commit and push all changes in one step, with safety checks
 .RI [ n ]
 .RI [ type ]
 .br
+.B gcp new
+.I type name
+.br
+.B gcp sync
+.RB [ \-y ]
+.br
+.B gcp pr
+.RB [ \-y ]
+.RB [ \-\-draft | \-\-merge ]
+.br
+.B gcp changelog
+.RB [ \-\-all ]
+.RI [ since ]
+.br
+.B gcp release
+.RB [ \-y ]
+.RB [ \-n ]
+.RB [ major | minor | patch ]
+.br
 .B gcp
 .RB \-h | \-\-help | \-v | \-V | \-\-version
 .SH DESCRIPTION
@@ -113,6 +132,95 @@ With a
 only commits of that type are shown;
 .B breaking
 shows breaking changes.
+.SH BRANCH WORKFLOW
+These subcommands cover the way from a new branch to a release:
+.B gcp new
+\(-> commits with
+.B gcp
+\(->
+.B gcp pr
+\(->
+.BR "gcp release" .
+The base branch is
+.IB remote /HEAD
+if known, otherwise
+.BR main ,
+otherwise
+.BR master .
+The remote is
+.B origin
+or the only configured one.
+.TP
+.B new \fItype name\fR...
+Fetches the base branch and creates
+.IB type / name
+from the remote state, without an upstream, so the first
+.B gcp
+commit pushes the new branch.
+The name is lowercased and spaces become dashes:
+.B gcp new feat Login Form
+creates
+.BR feat/login-form .
+Uncommitted changes are taken along.
+.TP
+.B sync \fR[\fB\-y\fR]
+Brings the current branch up to date with the base branch: first pulls
+commits pushed to the branch itself, then rebases it onto the latest base
+.RB ( \-\-autostash ).
+If commits of the branch are already pushed, the rebase gives them new
+hashes; after a confirmation the branch is pushed with
+.BR \-\-force\-with\-lease .
+On the base branch itself,
+.B sync
+just pulls. On a conflict the rebase stops and
+.B gcp
+explains how to continue or abort.
+.TP
+.B pr \fR[\fB\-y\fR] [\fB\-\-draft\fR | \fB\-\-merge\fR]
+Pushes the branch and creates a pull request against the base branch with
+.BR gh (1).
+With one commit, its message is the title; with several, the title is
+built from the branch name
+.RB ( "feat/login-form" " \(-> " "feat: ✨ login form" ),
+so a squash merge again gives a Conventional Commit.
+The body lists the commits. If a pull request is already open, the
+branch is only pushed.
+.B \-\-draft
+creates a draft.
+.B \-\-merge
+squash merges the pull request right away, deletes the branch, switches
+to the base branch and updates it.
+.TP
+.B changelog \fR[\fB\-\-all\fR] [\fIsince\fR]
+Prints a Markdown changelog of the commits since the last
+.BI v X . Y . Z
+tag (or since
+.IR since ,
+a tag or commit), grouped into breaking changes, features, bug fixes and
+performance. Gitmoji are removed, scopes are shown in bold.
+.B \-\-all
+adds the other types (docs, refactor, ...) and non-conventional commits.
+Redirect it to a file to keep it, e.g.
+.BR "gcp changelog > CHANGES.md" .
+.TP
+.B release \fR[\fB\-y\fR] [\fB\-n\fR] [\fBmajor\fR|\fBminor\fR|\fBpatch\fR]
+Tags the next version on the base branch and pushes the tag.
+The version follows Semantic Versioning from the commits since the last
+tag: a breaking change bumps major (minor while still 0.x), a
+.B feat
+bumps minor, everything else patch. The first release is v0.1.0.
+.BR major ", " minor " or " patch
+overrides this.
+The branch must be clean, pushed and up to date.
+With
+.BR gh (1)
+and a GitHub remote, a GitHub release with the changelog as notes is
+created too.
+.BR \-n ", " \-\-dry\-run
+shows version and notes without tagging.
+.B release
+does not change files; if the project stores its version in a file,
+commit that change first.
 .SH COMMIT MESSAGE
 The header must follow Conventional Commits 1.0.0:
 .PP
@@ -303,6 +411,17 @@ Success, nothing to commit, or aborted by the user.
 .B 1
 A check failed or a git command failed.
 .SH EXAMPLES
+From a new branch to a release:
+.PP
+.RS
+.nf
+$ gcp new feat login form
+$ gcp "feat: add login form"
+$ gcp pr \-\-merge
+$ gcp release
+.fi
+.RE
+.PP
 Add a forgotten file to the last commit, then undo a commit:
 .PP
 .RS
