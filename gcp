@@ -1291,7 +1291,12 @@ cmd_pr() {
     echo "Pull request: $url"
 
     if (( merge )); then
-        gh pr merge "$BRANCH" --squash --delete-branch \
+        # The PR title (maybe edited on GitHub) becomes the commit on the base branch;
+        # without --subject GitHub uses the commit message for one-commit PRs
+        local subject
+        subject="$(gh pr view "$BRANCH" --json title,number -q '"\(.title) (#\(.number))"')" \
+            || die "could not read the pull request. It stays open: $url"
+        gh pr merge "$BRANCH" --squash --delete-branch --subject "$subject" \
             || die "merging failed (checks, reviews or conflicts?). The PR stays open: $url"
         # gh usually switches back already; make sure and update the base branch
         if [[ "$(git branch --show-current)" != "$base" ]]; then
